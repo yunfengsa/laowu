@@ -558,10 +558,21 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.state.inbox(), before)
         self.gateway.tick()
         self.assertEqual([row['status'] for row in self.state.inbox()], ['cancelled', 'cancelled'])
-        self.assertEqual([row['error'] for row in self.state.inbox()], ['user_stopped', 'user_stopped'])
-        self.assertEqual(self.state.outputs(), [])
+        # Recovery completes local stop cleanup without resubmitting the old
+        # requests or replaying a model interrupt. Only bounded stop receipts
+        # may be delivered; they must also remain idempotent on later ticks.
+        self.assertEqual([row['error'] for row in self.state.inbox()],
+                         ['user_stop_interrupt_uncertain', 'user_stop_interrupt_uncertain'])
+        self.assertEqual(len(self.state.outputs()), 2)
+        self.assertEqual(len(self.api.posts), 2)
+        self.assertTrue(all('同步任务已取消' in post['text'] and '模型停止尚未确认' in post['text']
+                            for post in self.api.posts))
+        self.assertTrue(all(post['channel'] == 'CONE' and post['thread_ts'] == root_ts
+                            for post in self.api.posts))
+        self.gateway.tick()
+        self.assertEqual(len(self.state.outputs()), 2)
+        self.assertEqual(len(self.api.posts), 2)
         self.assertEqual(FakeSession.created, [])
-        self.assertEqual(self.api.posts, [])
 
     def test_pause_keeps_new_input_and_output_durable_without_model(self):
         self.gateway.ingest(self.event('<@UBOT> 队列任务'))

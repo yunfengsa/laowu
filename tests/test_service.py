@@ -185,7 +185,10 @@ class ServiceTests(unittest.TestCase):
         try:
             with self.service.store.transaction() as db:
                 db.execute("UPDATE runs SET child_pid=?,child_identity=? WHERE id='run_a'", (child.pid, process_identity(child.pid)))
-            with patch("laowu.service.time.monotonic", side_effect=[0, 10]):
+            # Replace this module's clock, not the shared time module used by
+            # independent process cleanup during cancellation.
+            with patch("laowu.service.time") as clock:
+                clock.monotonic.side_effect = [0, 10]
                 with self.assertRaises(RuntimeError):
                     self.service.call("memory_forget", {"memory_id": fact["id"]})
             self.assertEqual(len(self.service.store.memory_search()), 1)

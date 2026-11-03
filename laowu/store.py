@@ -190,19 +190,27 @@ class Store:
                     conn.rollback()
                     raise
             ledger = self._ledger()
-            if ledger["ids"]:
+            if ledger["ids"] or ledger.get("pending"):
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     doomed = self._descendants(conn, ledger["ids"])
+                    applied = {**ledger, "ids": sorted(set(ledger["ids"]) | doomed)}
+                    resurfaced = self._contains_memories(conn, doomed)
                     self._delete(conn, doomed)
-                    if ledger.get("pending"):
+                    if ledger.get("pending") or resurfaced:
                         self._assert_no_active(conn, sessions=False)
-                        self._scrub_runtime(conn)
+                        self._write_ledger(set(applied["ids"]), pending=True)
+                        # A completed database replacement may only be waiting
+                        # for file cleanup. Do not erase its newer task material
+                        # again when replaying that pending ledger.
+                        if resurfaced or not self._forget_applied(conn, ledger):
+                            self._scrub_runtime(conn)
                         self._clear_runtime_files()
                         self._purge_backups()
+                    self._mark_forget_applied(conn, applied)
                     conn.commit()
-                    if ledger.get("pending"):
-                        self._write_ledger(set(ledger["ids"]) | doomed, pending=False)
+                    if ledger.get("pending") or resurfaced or set(applied["ids"]) != set(ledger["ids"]):
+                        self._write_ledger(set(applied["ids"]), pending=False)
                 except BaseException:
                     conn.rollback()
                     raise
@@ -210,14 +218,47 @@ class Store:
     def _ledger(self) -> dict:
         self._safe(self.ledger_path)
         if not self.ledger_path.exists():
-            return {"ids": [], "pending": False}
-        data = json.loads(self.ledger_path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or not isinstance(data.get("ids"), list) or not all(isinstance(i, str) for i in data["ids"]):
-            raise ValueError("遗忘记录损坏；为避免恢复已遗忘内容，停止读取")
-        return data
+            return {"ids": [], "pending": False, "cleanup_events": []}
+        return self._validated_ledger(json.loads(self.ledger_path.read_text(encoding="utf-8")))
 
-    def _write_ledger(self, ids: set[str], *, pending: bool) -> None:
-        atomic_write(self.ledger_path, json_text({"version": 1, "ids": sorted(ids), "pending": pending}))
+    @staticmethod
+    def _validated_ledger(data: Any) -> dict:
+        if (not isinstance(data, dict) or not isinstance(data.get("ids"), list)
+                or not all(isinstance(i, str) for i in data["ids"])
+                or ("version" in data and (type(data["version"]) is not int or data["version"] != 1))
+                or type(data.get("pending", False)) is not bool
+                or not isinstance(data.get("cleanup_events", []), list)
+                or not all(isinstance(i, str) and re.fullmatch(r"forget_[a-f0-9]{32}", i)
+                           for i in data.get("cleanup_events", []))):
+            raise ValueError("遗忘记录损坏；为避免恢复已遗忘内容，停止读取")
+        return {**data, "pending": data.get("pending", False),
+                "cleanup_events": data.get("cleanup_events", [])}
+
+    def _write_ledger(self, ids: set[str], *, pending: bool, cleanup_events=None) -> None:
+        events = self._ledger()["cleanup_events"] if cleanup_events is None else cleanup_events
+        atomic_write(self.ledger_path, json_text({"version": 1, "ids": sorted(ids), "pending": pending,
+                                                "cleanup_events": sorted(set(events))}))
+
+    @staticmethod
+    def _ledger_watermark(ledger: dict) -> str:
+        # Include deletion intents, not only record IDs: forgetting the same ID
+        # again must also revoke material created since its previous cleanup.
+        applied = {"ids": sorted(set(ledger["ids"])),
+                   "cleanup_events": sorted(set(ledger.get("cleanup_events", [])))}
+        return hashlib.sha256(json_text(applied).encode()).hexdigest()
+
+    @staticmethod
+    def _contains_memories(conn: sqlite3.Connection, ids: set[str]) -> bool:
+        return any(conn.execute("SELECT 1 FROM memory_records WHERE id=?", (ident,)).fetchone()
+                   for ident in ids)
+
+    def _forget_applied(self, conn: sqlite3.Connection, ledger: dict) -> bool:
+        row = conn.execute("SELECT value FROM memory_meta WHERE key='forget_applied_watermark'").fetchone()
+        return bool(row and row[0] == self._ledger_watermark(ledger))
+
+    def _mark_forget_applied(self, conn: sqlite3.Connection, ledger: dict) -> None:
+        conn.execute("INSERT OR REPLACE INTO memory_meta VALUES('forget_applied_watermark',?)",
+                     (self._ledger_watermark(ledger),))
 
     @staticmethod
     def _visible(scope: str, actor: str, task_id: str | None = None) -> bool:
@@ -311,7 +352,7 @@ class Store:
             if old and (old["content"] != content or old["scope"] != scope):
                 descendants = self._descendants(conn, [mid], include=False)
                 if descendants:
-                    self._write_ledger(set(ledger["ids"]) | descendants, pending=False)
+                    self._write_ledger(set(ledger["ids"]) | descendants, pending=ledger["pending"])
                     self._delete(conn, descendants)
                 # Corrections invalidate managed snapshots containing the old
                 # value. External exports are intentional historical snapshots;
@@ -392,16 +433,24 @@ class Store:
             self._assert_no_active(conn, sessions=False)
             doomed = self._descendants(conn, [memory_id])
             count = sum(conn.execute("SELECT count(*) FROM memory_records WHERE id=?", (i,)).fetchone()[0] for i in doomed)
-            all_ids = set(self._ledger()["ids"]) | doomed
+            ledger = self._ledger()
+            all_ids = set(ledger["ids"]) | doomed
+            events = set(ledger["cleanup_events"]) | {new_id("forget")}
             # Persist deletion intent first. A crash can only cause extra removal,
             # never silently restore a fact the user explicitly forgot.
-            self._write_ledger(all_ids, pending=True)
+            self._write_ledger(all_ids, pending=True, cleanup_events=events)
             self._delete(conn, doomed)
             self._scrub_runtime(conn)
             self._clear_runtime_files()
             removed = self._purge_backups()
+            self._mark_forget_applied(conn, {"ids": all_ids, "cleanup_events": events})
         with self._lock(), contextlib.closing(self.connect()) as conn:
-            self._write_ledger(set(self._ledger()["ids"]) | all_ids, pending=False)
+            # Another forget can start after this transaction commits. Only
+            # finalize the current ledger when its own cleanup has committed;
+            # an earlier successful caller must not clear a later failed intent.
+            current = self._ledger()
+            if self._forget_applied(conn, current):
+                self._write_ledger(set(current["ids"]) | all_ids, pending=False)
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         return {"forgotten_ids": sorted(doomed), "deleted_count": count, "removed_backups": removed}
 
@@ -414,6 +463,8 @@ class Store:
         return {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
 
     def _assert_no_active(self, conn: sqlite3.Connection, *, sessions: bool = True) -> None:
+        if self._columns(conn, "run_cleanup") and conn.execute("SELECT 1 FROM run_cleanup LIMIT 1").fetchone():
+            raise RuntimeError("仍有未确认清理的任务进程组，请先完成清理后再操作")
         checks = [("runs", ("supervisor", "child"))]
         if sessions:
             checks.append(("sessions", ("owner",)))
@@ -543,6 +594,10 @@ class Store:
             conn.execute('DELETE FROM connections')
         if self._columns(conn, 'daemon_state'):
             conn.execute('DELETE FROM daemon_state')
+        if self._columns(conn, 'run_cleanup'):
+            # Cleanup leases and their group witnesses belong to the source
+            # machine, just like the process identities cleared above.
+            conn.execute('DELETE FROM run_cleanup')
         if self._columns(conn, 'background_meta'):
             conn.execute("INSERT OR REPLACE INTO background_meta VALUES('paused','1')")
         if self._columns(conn, 'notifications'):
@@ -673,6 +728,12 @@ class Store:
         self.backups.mkdir(mode=0o700, exist_ok=True)
         self.backups.chmod(0o700)
         destination = self.backups / (new_id("snapshot") + ".zip")
+        ledger = self._ledger()
+        # This is a live-store upgrade path, never an imported snapshot upgrade:
+        # legacy pending=false records completion of the old cleanup protocol.
+        # A missing/unfinished cleanup or resurfaced row cannot receive proof.
+        complete = not ledger["pending"] and not self._contains_memories(
+            conn, self._descendants(conn, ledger["ids"]))
         with tempfile.TemporaryDirectory(prefix="backup-", dir=self.private) as tmp:
             database = Path(tmp) / "state.sqlite3"
             with contextlib.closing(sqlite3.connect(database)) as target:
@@ -681,11 +742,13 @@ class Store:
                     target.execute('DELETE FROM slack_bindings')
                     target.commit()
             files = {"state.sqlite3": database.read_bytes(),
-                     "forgotten.json": json_text(self._ledger()).encode()}
+                     "forgotten.json": json_text(ledger).encode()}
             files.update({"assets/" + name: path.read_bytes() for name, path in self._assets()})
             manifest = {"format": "laowu-backup", "version": 1, "schema_version": SCHEMA_VERSION,
                         "source_root": str(self.root),
                         "created_at": now(), "files": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
+            if complete:
+                manifest["forget_watermark"] = self._ledger_watermark(ledger)
             temporary = Path(tmp) / "snapshot.zip"
             with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
                 archive.writestr("manifest.json", json_text(manifest))
@@ -725,9 +788,7 @@ class Store:
             blobs = {name: archive.read(name) for name in names if name != "manifest.json"}
             if set(manifest.get("files", {})) != set(blobs) or any(hashlib.sha256(data).hexdigest() != manifest["files"][name] for name, data in blobs.items()):
                 raise ValueError("备份校验失败")
-            imported_ledger = json.loads(blobs["forgotten.json"])
-            if not isinstance(imported_ledger, dict) or not isinstance(imported_ledger.get("ids"), list) or not all(isinstance(i, str) for i in imported_ledger["ids"]):
-                raise ValueError("备份遗忘记录损坏")
+            imported_ledger = self._validated_ledger(json.loads(blobs["forgotten.json"]))
         with self._lock(), contextlib.closing(self.connect()) as current:
             self._assert_no_active(current)
             with tempfile.TemporaryDirectory(prefix="restore-", dir=self.private) as tmp:
@@ -743,21 +804,35 @@ class Store:
                         raise ValueError("备份数据库版本不兼容")
                     from .migrations import upgrade
                     upgrade(source)
-                    ids = set(self._ledger()["ids"]) | set(imported_ledger["ids"])
+                    ledger = self._ledger()
+                    ids = set(ledger["ids"]) | set(imported_ledger["ids"])
+                    events = set(ledger["cleanup_events"]) | set(imported_ledger["cleanup_events"])
                     doomed = self._descendants(source, ids)
+                    # A current snapshot proves which completed deletion intents
+                    # its material already excludes. Legacy snapshots have no
+                    # such proof and remain conservative, even with no surviving
+                    # memory rows: isolated task text can still quote old facts.
+                    covered = (not ledger["pending"] and not imported_ledger["pending"]
+                               and manifest.get("forget_watermark") == self._ledger_watermark(imported_ledger)
+                               and set(ledger["ids"]) <= set(imported_ledger["ids"])
+                               and set(ledger["cleanup_events"]) <= set(imported_ledger["cleanup_events"]))
+                    scrub = ((bool(ids) or ledger["pending"] or imported_ledger["pending"])
+                             and (not covered or self._contains_memories(source, doomed)))
+                    applied = {"ids": ids | doomed, "cleanup_events": events}
                     source.execute("BEGIN IMMEDIATE")
                     self._delete(source, doomed)
-                    if doomed:
+                    if scrub:
                         self._scrub_runtime(source)
                     self._reset_runtime_after_restore(source)
                     self._remap_runtime_paths(source, manifest.get("source_root"))
+                    self._mark_forget_applied(source, applied)
                     source.commit()
                     before = self._backup_locked(current)
                     assets = {name[7:]: data for name, data in blobs.items() if name.startswith("assets/")}
                     previous_assets = {name: path.read_bytes() for name, path in self._assets()}
                     try:
                         self._apply_assets(assets)
-                        self._write_ledger(ids | doomed, pending=True)
+                        self._write_ledger(ids | doomed, pending=True, cleanup_events=events)
                         source.backup(current)
                     except BaseException:
                         # All original assets and the database also exist in the
@@ -770,5 +845,5 @@ class Store:
                         self._apply_assets(previous_assets)
                         raise
                 self._clear_runtime_files()
-                self._write_ledger(ids | doomed, pending=False)
+                self._write_ledger(ids | doomed, pending=False, cleanup_events=events)
             return {"restored": True, "path": str(snapshot.resolve()), "previous_backup": before["path"], "forgotten_filtered": len(doomed)}

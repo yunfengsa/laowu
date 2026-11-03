@@ -572,6 +572,21 @@ class SlackGateway:
         config = self.state.config()
         if not config.get('enabled'):
             return
+        # A transport interruption must not strand the independent local
+        # cancellation. These durable markers also survive a gateway restart.
+        with contextlib.closing(self.store.connect()) as db:
+            stopped = [dict(row) for row in db.execute("SELECT * FROM slack_inbox WHERE status='cancelled' "
+                       "AND (error='user_stopped' OR error GLOB 'user_stop_cleanup_pending*')")]
+        for record in stopped:
+            key = record['team_id'], record['channel_id']
+            if key not in self.running and self.retry_at.get(record['id'], 0) <= self.clock():
+                try:
+                    self._finish_stop(record, retry=True)
+                except Exception as exc:
+                    # One damaged/unavailable stop record must not prevent
+                    # delivery or scheduling for every other input.
+                    self.retry_at[record['id']] = self.clock() + 2
+                    _LOG.warning('Slack停止恢复未完成: %s', _safe_error(exc))
         if self._paused():
             self.deliver_outputs(alerts_only=True)
             return
@@ -615,6 +630,7 @@ class SlackGateway:
         start_time = self.clock()
         from .metrics import begin,seconds
         key = record['team_id'], record['channel_id']
+        session, turn_id = None, record.get('turn_id')
         try:
             best_effort(begin, self.store,record['id'],'slack',seconds(record['created_at']),start_time)
             best_effort(self.monitor.start, 'slack:'+record['id'],'slack',origin=f"slack:{record['team_id']}:{record['channel_id']}:{record['generation']}",
@@ -682,10 +698,6 @@ class SlackGateway:
                 best_effort(self.monitor.observe, 'slack:'+record['id'],heartbeat=True)
                 current = self._input(record['id'])
                 if current and current['status'] == 'cancelled':
-                    if turn_id:
-                        session.interrupt(turn_id)
-                    self._cancel_sync(record)
-                    self.state.queue_output(record['id'], '本次请求已停止。', key='stopped')
                     return
                 if receipt['status'] == 'completed':
                     text = receipt.get('final_text', '')
@@ -710,9 +722,13 @@ class SlackGateway:
                 self.closed.wait(1)
                 receipt = self.reads.call(record['id']+':receipt','slack.receipt',lambda:self._receipt(session,receipt_key,turn_id))
         except (RetryPending,RetrySuspended) as exc:
-            status = self.state.read_source('input',record['id'])
-            if isinstance(exc,RetrySuspended): status = 'blocked'
-            self.state.update_input(record['id'],status=status,error=type(exc).__name__)
+            with self.store._lock():
+                live = self._input(record['id'])
+                if not live or live['status'] == 'cancelled' or live['generation'] != record['generation']:
+                    return
+                status = self.state.read_source('input',record['id'])
+                if isinstance(exc,RetrySuspended): status = 'blocked'
+                self.state.update_input(record['id'],status=status,error=type(exc).__name__)
             self.retry_at[record['id']] = self.clock() + 2
         except Exception as exc:
             # Unknown submission is reconciled on restart/next iteration, never
@@ -729,6 +745,8 @@ class SlackGateway:
         finally:
             try:
                 current = best_effort(self._input, record['id'])
+                if current and current['status'] == 'cancelled' and current['error'] == 'user_stopped':
+                    self._finish_stop(current, session=session, turn_id=turn_id)
                 if current and current['status'] in ('completed','failed','interrupted','cancelled','blocked'):
                     best_effort(self.monitor.observe, 'slack:'+record['id'],finished=True)
                     from .metrics import finish
@@ -758,11 +776,77 @@ class SlackGateway:
             raise ReceiptUnavailable()
         return ts
 
-    def _cancel_sync(self, record):
+    def _finish_stop(self, record, *, session=None, turn_id=None, retry=False):
+        """Cancel local work independently; never replay an uncertain RPC."""
+        cleanup_error = None
+        try:
+            self._cancel_sync(record, strict=True)
+        except Exception as exc:
+            cleanup_error = _safe_error(exc)
+
+        interrupt_error = None
+        if retry:
+            previous = record.get('error') or ''
+            interrupt_uncertain = previous == 'user_stopped' or 'interrupt_uncertain' in previous
+        else:
+            interrupt_uncertain = True
+            if session is not None and turn_id:
+                try:
+                    session.interrupt(turn_id)
+                    interrupt_uncertain = False
+                except Exception as exc:
+                    interrupt_error = _safe_error(exc)
+
+        if cleanup_error:
+            error = 'user_stop_cleanup_pending'
+            if interrupt_uncertain:
+                error += '_interrupt_uncertain'
+            error += ':' + cleanup_error
+            if interrupt_error:
+                error += ':' + interrupt_error
+            message = ('模型停止尚未确认，且同步任务取消尚未完成；'
+                       if interrupt_uncertain else '已请求停止本轮模型执行，但同步任务取消尚未完成；')
+            message += '系统会重试本地取消，请检查本机 Slack 状态。'
+            output_key = 'stop-cleanup-pending:' + str(interrupt_uncertain)
+            self.retry_at[record['id']] = self.clock() + 2
+        else:
+            error = ('user_stop_interrupt_uncertain' + (':' + interrupt_error if interrupt_error else '')
+                     if interrupt_uncertain else 'user_stop_cleanup_complete')
+            message = ('本次请求的同步任务已取消；模型停止尚未确认，请在本机核查本轮状态。'
+                       if interrupt_uncertain else '已请求停止本轮模型执行，并取消本次请求的同步任务。')
+            output_key = 'stopped:' + str(interrupt_uncertain)
+            self.retry_at.pop(record['id'], None)
+        # The result marker and receipt form one commit. Delivery can clear a
+        # settled receipt's body, so a recovery must also reuse that receipt
+        # without restoring its text or sending it again.
+        with self.store.transaction() as db:
+            current = db.execute('SELECT status,generation FROM slack_inbox WHERE id=?',
+                                 (record['id'],)).fetchone()
+            if not current or current['status'] != 'cancelled' or current['generation'] != record['generation']:
+                return
+            if not retry or not cleanup_error:
+                part = int(hashlib.sha256(output_key.encode()).hexdigest()[:12], 16)
+                existing = db.execute('SELECT body,blocks,status FROM slack_outbox WHERE input_id=? AND part=?',
+                                      (record['id'], part)).fetchone()
+                if existing:
+                    purged = existing['status'] in ('sent', 'cancelled') and not existing['body']
+                    if existing['blocks'] != '[]' or (existing['body'] != message and not purged):
+                        raise ValueError('同一停止回执标识已用于不同内容')
+                else:
+                    ident, stamp = new_id('slackout'), now()
+                    db.execute('INSERT INTO slack_outbox(id,input_id,part,body,blocks,created_at,updated_at) '
+                               'VALUES(?,?,?,?,?,?,?)', (ident, record['id'], part, message, '[]', stamp, stamp))
+                    db.execute("INSERT INTO read_sources VALUES('output',?,'pending')", (ident,))
+            # Only bounded codes are saved; never exception/provider payloads.
+            db.execute('UPDATE slack_inbox SET error=?,updated_at=? WHERE id=?', (error, now(), record['id']))
+
+    def _cancel_sync(self, record, *, strict=False):
         from .access import cancel_input_tasks
         ident = 'slack:' + record['team_id'] + ':' + record['channel_id'] + ':' + str(record['generation'])
+        if strict:
+            return cancel_input_tasks(self.store, ident, record['id'])
         with contextlib.suppress(PermissionError, ValueError):
-            cancel_input_tasks(self.store, ident, record['id'])
+            return cancel_input_tasks(self.store, ident, record['id'])
 
     def _paused(self):
         with self.store.connect() as db:
