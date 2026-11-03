@@ -42,12 +42,32 @@ def slack_text(text):
                   lambda m: '<' + m.group(2) + '|' + m.group(1) + '>', text)
 _ROOT = re.compile(r'\A<root>\s*(.*?)\s*</root>\Z', re.S)
 _TOKEN = re.compile(r'\b(?:xox[baprs]-|xapp-)[A-Za-z0-9-]+')
+_USER_MENTION = re.compile(r'<@([UW][A-Z0-9]+)(?:\|[^<>|\r\n]+)?>')
+_MENTION_LITERAL = re.compile(
+    r'^[ \t]*(?:>{3}|(?:&gt;){3})[\s\S]*'
+    r'|^[ \t]*(?:>|&gt;)[^\r\n]*'
+    r'|```[\s\S]*?(?:```|\Z)'
+    r'|`[^`\r\n]*(?:`|(?=\r?$))', re.M)
+
+
+def _mentioned_users(text):
+    """Read recipients from raw Slack text, not decoded display text.
+
+    Mask code and quote literals (including unfinished code and >>> quotes).
+    This deliberately does not parse blocks, attachments or display names.
+    """
+    return set(_USER_MENTION.findall(_MENTION_LITERAL.sub(' ', text)))
 
 
 def normalize_message(text, bot_id):
     """Decode Slack entities; only a direct, whole-message root tag changes mode."""
-    text = html.unescape(text or '')
-    text = re.sub(r'^\s*<@' + re.escape(bot_id) + r'>\s*', '', text).strip()
+    text = (text or '').lstrip()
+    prefix = '<@' + bot_id + '>'
+    if bot_id and text.startswith(prefix):
+        text = text[len(prefix):]
+    # Keep the existing canonical prefix; routing compatibility must not
+    # expand root parsing, and escaped examples must not expose root.
+    text = html.unescape(text).strip()
     return text, 'root' if _ROOT.fullmatch(text) else 'normal'
 
 
@@ -143,17 +163,25 @@ class SlackGateway:
         ts = event.get('ts')
         if not isinstance(ts, str) or not re.fullmatch(r'\d+\.\d+', ts):
             return False
-        row = self.state.channel(team, channel_id, create=True)
         bot_id = config.get('bot_user_id', '')
-        raw = event.get('text', '')
-        mentioned = bool(bot_id and re.search(r'<@' + re.escape(bot_id) + '>', raw))
+        raw = event.get('text') or ''
+        mentions = _mentioned_users(raw)
+        mentioned = bool(bot_id and bot_id in mentions)
         is_dm = event.get('channel_type') == 'im' or channel_id.startswith('D')
+        # Explicit recipients outrank thread engagement, direct mode and even
+        # a contradictory app_mention event. Ignore before registering a channel.
+        if not is_dm and mentions and not mentioned:
+            return False
+        row = self.state.channel(team, channel_id)
+        mode = row['mode'] if row else 'mention'
         root_ts = event.get('thread_ts') or ts
-        if not (is_dm or row['mode'] == 'direct' or mentioned or kind == 'app_mention'
+        if not (is_dm or mode == 'direct' or mentioned
                 or (event.get('thread_ts') and self.state.engaged(team, channel_id, root_ts))):
             return False
         text, context = normalize_message(raw, bot_id)
-        if not text and not event.get('files'):
+        bare_mention = _USER_MENTION.fullmatch(raw.strip())
+        no_request = not text or (bare_mention and bare_mention.group(1) == bot_id)
+        if no_request and not event.get('files'):
             return False
         # Credentials should never be forwarded to a model or durable history.
         text = _TOKEN.sub('[Slack令牌已移除，请在本机凭据文件配置]', text)
@@ -161,7 +189,7 @@ class SlackGateway:
             text += '\n[本条含附件；首版暂不读取附件，请仅根据已有文字回应并告知附件支持范围。]'
         if len(text) > 32000:
             text = text[:31800] + '\n[输入超出32000字符，后续内容未接收，请分开发送。]'
-        reply_ts = root_ts if (not is_dm and row['mode'] == 'mention') else event.get('thread_ts')
+        reply_ts = root_ts if (not is_dm and mode == 'mention') else event.get('thread_ts')
         record = self.state.enqueue(team, channel_id, ts, text, reply_ts=reply_ts,
                                     context=context, event_id=payload.get('event_id'))
         self.state.engage(team, channel_id, root_ts)
