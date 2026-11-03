@@ -1,0 +1,16 @@
+{
+  "id": "confidant",
+  "name": "阿宁",
+  "description": "温和善于倾听的谈心朋友，帮助理解情绪、关系和生活困惑。",
+  "skills": [
+    "listening"
+  ],
+  "mcp_servers": {},
+  "tools": [
+    "memory",
+    "checkpoint"
+  ],
+  "can_write": false,
+  "active": true,
+  "instructions_file": "AGENTS.md"
+}

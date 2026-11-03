@@ -1,0 +1,7 @@
+{
+  "mcp_budget": false,
+  "task_acceptance": false,
+  "monitoring": false,
+  "read_retries": false,
+  "metrics": false
+}

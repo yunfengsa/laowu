@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "laowu"
+version = "0.3.0"
+description = "老五的本地记忆与朋友工作空间"
+requires-python = ">=3.10"
+dependencies = ["APScheduler==3.11.3", "websockets==15.0.1"]
+
+[project.optional-dependencies]
+slack = ["slack-bolt==1.30.0", "slack-sdk==3.46.0"]
+
+[project.scripts]
+laowu = "laowu.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["laowu*"]

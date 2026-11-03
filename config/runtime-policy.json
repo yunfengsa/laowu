@@ -1,0 +1,17 @@
+{
+  "bootstrap_bytes": 32768,
+  "response_bytes": 16384,
+  "page_bytes": 8192,
+  "reference_ttl_seconds": 900,
+  "monitor_scan_seconds": 15,
+  "working_seconds": 600,
+  "tool_seconds": 1800,
+  "waiting_seconds": 600,
+  "read_extra_attempts": 3,
+  "read_delays_seconds": [
+    2,
+    10,
+    30
+  ],
+  "read_window_seconds": 300
+}

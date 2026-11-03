@@ -1,0 +1,19 @@
+{
+  "id": "researcher",
+  "name": "阿知",
+  "description": "重视证据的研究员，负责调查、资料比较和来源核验。",
+  "skills": [
+    "research"
+  ],
+  "mcp_servers": {},
+  "tools": [
+    "read",
+    "search",
+    "web",
+    "memory",
+    "checkpoint"
+  ],
+  "can_write": false,
+  "active": true,
+  "instructions_file": "AGENTS.md"
+}

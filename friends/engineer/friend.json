@@ -1,0 +1,20 @@
+{
+  "id": "engineer",
+  "name": "阿衡",
+  "description": "严谨务实的工程师，负责编码、调试、测试及技术实现。",
+  "skills": [
+    "engineering"
+  ],
+  "mcp_servers": {},
+  "tools": [
+    "read",
+    "write",
+    "shell",
+    "search",
+    "memory",
+    "checkpoint"
+  ],
+  "can_write": true,
+  "active": true,
+  "instructions_file": "AGENTS.md"
+}

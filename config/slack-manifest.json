@@ -1,0 +1,26 @@
+{
+  "display_information": {
+    "name": "老五",
+    "description": "能接续记忆、安排专业工作和主动交接结果的朋友",
+    "background_color": "#36554A"
+  },
+  "features": {
+    "bot_user": {"display_name": "laowu", "always_online": false},
+    "app_home": {"home_tab_enabled": false, "messages_tab_enabled": true, "messages_tab_read_only_enabled": false},
+    "agent_view": {"agent_description": "我是老五。可以聊问题、托付任务，也会在有结果时回来告诉你。"}
+  },
+  "oauth_config": {"scopes": {"bot": [
+    "assistant:write", "app_mentions:read", "chat:write", "channels:history", "channels:read",
+    "groups:history", "groups:read", "im:history", "im:read"
+  ]}},
+  "settings": {
+    "socket_mode_enabled": true,
+    "org_deploy_enabled": false,
+    "token_rotation_enabled": false,
+    "interactivity": {"is_enabled": true},
+    "event_subscriptions": {"bot_events": [
+      "app_mention", "message.channels", "message.groups", "message.im", "app_home_opened",
+      "member_joined_channel", "member_left_channel", "agent_session_stopped"
+    ]}
+  }
+}
