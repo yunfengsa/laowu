@@ -6,6 +6,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from laowu.common import now
 from laowu.slack_client import SlackAPI, SlackAPIError, split_message
@@ -137,6 +138,22 @@ class GatewayTests(unittest.TestCase):
             time.sleep(0.005)
         self.fail('gateway未完成测试任务')
 
+    def routing_snapshot(self):
+        with self.store.connect() as db:
+            return {table: [tuple(row) for row in db.execute('SELECT * FROM ' + table + ' ORDER BY rowid')]
+                    for table in ('slack_channels', 'slack_threads', 'slack_inbox', 'slack_outbox', 'read_sources')}
+
+    def assert_ignored_without_routing_effects(self, payload):
+        before = self.routing_snapshot()
+        self.gateway.wake.clear()
+        self.assertFalse(self.gateway.ingest(payload))
+        self.assertEqual(self.routing_snapshot(), before)
+        self.assertFalse(self.gateway.wake.is_set())
+        self.assertEqual(FakeSession.created, [])
+        self.assertEqual(self.api.posts, [])
+        self.assertEqual(self.api.statuses, [])
+        self.assertEqual(self.api.modal_calls, [])
+
     def test_current_source_and_thread_are_bound_without_fetching_history(self):
         self.assertTrue(self.gateway.ingest(self.event('<@UBOT> 前面说了什么', thread_ts='1783000000.000001')))
         self.drain()
@@ -162,6 +179,185 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(self.gateway.ingest(self.event('', channel='DONE', files=[{'id': 'FONE'}])))
         self.assertIn('首版暂不读取附件', self.state.inbox()[1]['body'])
         self.assertIsNone(self.state.inbox()[1]['reply_ts'])
+
+    def test_engaged_thread_addressed_only_to_other_user_is_ignored(self):
+        root_ts = '1783000000.100001'
+        self.state.channel('TONE', 'CONE', create=True)
+        self.state.engage('TONE', 'CONE', root_ts)
+        self.assert_ignored_without_routing_effects(self.event(
+            '<@UOTHER> 请处理', ts='1783000001.100001', thread_ts=root_ts))
+        self.gateway.tick()
+        self.assertEqual(self.state.inbox(), [])
+        self.assertEqual(self.state.outputs(), [])
+        self.assertEqual(FakeSession.created, [])
+
+    def test_other_recipients_override_engagement_direct_mode_and_app_mention(self):
+        root_ts = '1783000000.100001'
+        self.state.channel('TONE', 'CONE', create=True)
+        self.state.engage('TONE', 'CONE', root_ts)
+        self.state.update_channel('TONE', 'CTWO', mode='direct')
+        texts = (
+            '<@UOTHER> 请处理', '<@WOTHER> 请处理', '<@UOTHER|另一位> 请处理',
+            '<@UOTHER> <@UAGENT> 请处理', '<@UAGENT> &lt;root&gt;检查&lt;/root&gt;',
+            '<@UOTHER> 示例 &lt;@UBOT&gt;', '<@UOTHER> `<@UBOT>`',
+            '<@UOTHER>\n```\n<@UBOT>\n```', '<@UOTHER>\n> <@UBOT>',
+            '<@UOTHER>\n&gt; <@UBOT>', '<@UOTHER|UBOT> 请处理',
+            '<@UOTHER> @UBOT 请处理',
+        )
+        # Busy channels would otherwise emit a queued receipt immediately.
+        with patch.dict(self.gateway.running, {('TONE', 'CONE'): object(), ('TONE', 'CTWO'): object()}):
+            for channel, thread_ts in (('CONE', root_ts), ('CTWO', None), ('CNEW', None)):
+                for kind in ('message', 'app_mention'):
+                    for text in texts:
+                        with self.subTest(channel=channel, kind=kind, text=text):
+                            self.assert_ignored_without_routing_effects(self.event(
+                                text, channel=channel, kind=kind, thread_ts=thread_ts))
+        self.assertIsNone(self.state.channel('TONE', 'CNEW'))
+        self.gateway.tick()
+        self.assertEqual(FakeSession.created, [])
+
+    def test_self_and_multiple_recipients_are_accepted_once(self):
+        texts = ('<@UBOT> 你好', '<@UOTHER> <@UBOT> 一起处理',
+                 '<@UBOT> <@UOTHER> 一起处理', '<@UOTHER> <@UBOT|老五> 一起处理',
+                 '<@UBOT|老五> 你好')
+        for index, text in enumerate(texts):
+            ts = f'178300000{index}.100001'
+            with self.subTest(text=text):
+                self.assertTrue(self.gateway.ingest(self.event(text, ts=ts)))
+                self.assertFalse(self.gateway.ingest(self.event(text, ts=ts, kind='app_mention')))
+                self.assertEqual(len(self.state.inbox()), index + 1)
+                self.drain()
+        self.assertEqual(len(FakeSession.created), 1)
+        self.assertEqual(len(FakeSession.created[0].starts), len(texts))
+        self.assertEqual(len(self.api.posts), len(texts))
+
+    def test_w_user_id_and_labelled_self_mention(self):
+        self.state.set_config({'bot_user_id': 'WBOT'})
+        self.assertTrue(self.gateway.ingest(self.event('<@WBOT|老五> &lt;root&gt;检查&lt;/root&gt;')))
+        self.assertEqual(self.state.inbox()[0]['context'], 'normal')
+        self.assertTrue(self.state.inbox()[0]['body'].startswith('<@WBOT|老五>'))
+        self.assertFalse(self.gateway.ingest(self.event('<@WBOT> 检查', kind='app_mention')))
+        self.assertEqual(len(self.state.inbox()), 1)
+
+    def test_app_mention_event_without_real_self_does_not_trigger(self):
+        texts = ('`<@UBOT>`', '```\n<@UBOT>\n```', '> <@UBOT>',
+                 '&gt; <@UBOT>', '&lt;@UBOT&gt;',
+                 '>>> 引用\n<@UBOT>', '@UBOT', '普通消息')
+        for index, text in enumerate(texts):
+            for kind in ('message', 'app_mention'):
+                with self.subTest(text=text, kind=kind):
+                    self.assert_ignored_without_routing_effects(self.event(
+                        text, channel=f'CLITERAL{index}', kind=kind))
+
+    def test_literals_do_not_address_users_or_prevent_thread_continuation(self):
+        root_ts = '1783000000.100001'
+        self.state.channel('TONE', 'CONE', create=True)
+        self.state.engage('TONE', 'CONE', root_ts)
+        texts = (
+            '普通续聊', '@UOTHER 普通名字', '&lt;@UOTHER&gt; 转义示例',
+            '`<@UOTHER>` 行内代码', '```\n<@UOTHER>\n```\n代码示例',
+            '> <@UOTHER> 引用\n继续聊', '&gt; <@UOTHER> 引用\n继续聊',
+            '>>> 引用\n<@UOTHER>', '&gt;&gt;&gt; 引用\n<@UOTHER>',
+            '`<@UOTHER>', '```\n<@UOTHER>',
+        )
+        for index, text in enumerate(texts):
+            with self.subTest(text=text):
+                # The same literal cannot start a conversation in an unknown thread.
+                self.assert_ignored_without_routing_effects(self.event(
+                    text.replace('UOTHER', 'UBOT'), channel='CNEW', thread_ts='1.000001'))
+                ts = f'178300001{index}.100001'
+                self.assertTrue(self.gateway.ingest(self.event(text, ts=ts, thread_ts=root_ts)))
+                item = self.state.inbox()[-1]
+                self.assertEqual(item['reply_ts'], root_ts)
+                self.assertEqual(item['context'], 'normal')
+        self.assertIsNone(self.state.channel('TONE', 'CNEW'))
+
+    def test_mentions_outside_code_and_quotes_still_address_users(self):
+        self.state.update_channel('TONE', 'CONE', mode='direct')
+        texts = (
+            '`<@UBOT>` <@UOTHER> 请处理', '```<@UBOT>``` <@UOTHER> 请处理',
+            '> <@UBOT>\n<@UOTHER> 请处理', '&gt; <@UBOT>\r\n<@UOTHER> 请处理',
+            '> ```<@UBOT>\n<@UOTHER> 请处理',
+        )
+        for index, text in enumerate(texts):
+            with self.subTest(text=text):
+                self.assert_ignored_without_routing_effects(self.event(text))
+                self.assertTrue(self.gateway.ingest(self.event(
+                    text.replace('UBOT', 'ULITERAL').replace('UOTHER', 'UBOT'),
+                    ts=f'178300000{index}.100001')))
+
+    def test_no_mention_in_unknown_thread_or_empty_input_creates_no_channel(self):
+        for text, extra in (('普通消息', {}), ('普通续聊', {'thread_ts': '1.000001'}),
+                            ('', {}), ('<@UBOT>', {}), ('<@UBOT|老五>', {})):
+            with self.subTest(text=text, extra=extra):
+                self.assert_ignored_without_routing_effects(self.event(text, **extra))
+        self.assertEqual(self.state.channels(), [])
+
+    def test_dm_keeps_third_party_mentions_as_conversation(self):
+        for index, extra in enumerate(({'channel': 'DONE'}, {'channel': 'CTWO', 'channel_type': 'im'})):
+            with self.subTest(extra=extra):
+                self.assertTrue(self.gateway.ingest(self.event(
+                    '<@UOTHER> 帮我解释这句话', ts=f'178300000{index}.100001', **extra)))
+                item = self.state.inbox()[-1]
+                self.assertEqual(item['body'], '<@UOTHER> 帮我解释这句话')
+                self.assertIsNone(item['reply_ts'])
+                self.assertEqual(item['context'], 'normal')
+
+    def test_recipient_rule_does_not_bypass_identity_or_event_filters(self):
+        self.state.channel('TONE', 'CONE', create=True)
+        root_ts = '1783000000.100001'
+        self.state.engage('TONE', 'CONE', root_ts)
+        for extra in ({'user': 'UOTHER'}, {'bot_id': 'BOTHER'}, {'subtype': 'bot_message'},
+                      {'subtype': 'message_changed'}, {'kind': 'reaction_added'}, {'ts': 'invalid'}):
+            with self.subTest(extra=extra):
+                self.assert_ignored_without_routing_effects(self.event(
+                    '<@UBOT> <@UOTHER> 你好', thread_ts=root_ts, **extra))
+        wrong_team = self.event('<@UBOT> 你好', channel='CNEW')
+        wrong_team['team_id'] = 'TOTHER'
+        self.assert_ignored_without_routing_effects(wrong_team)
+        self.state.set_config({'enabled': False})
+        self.assert_ignored_without_routing_effects(self.event('<@UBOT> 你好', channel='CNEW'))
+
+    def test_files_follow_recipient_rule_without_reading_attachment_text(self):
+        root_ts = '1783000000.100001'
+        self.state.channel('TONE', 'CONE', create=True)
+        self.state.engage('TONE', 'CONE', root_ts)
+        files = [{'id': 'FONE', 'title': '<@UBOT> 附件'}]
+        self.assert_ignored_without_routing_effects(self.event(
+            '<@UOTHER> 看附件', thread_ts=root_ts, subtype='file_share', files=files))
+        for index, text in enumerate(('', '<@UBOT> <@UOTHER> 看附件')):
+            self.assertTrue(self.gateway.ingest(self.event(
+                text, ts=f'178300000{index + 1}.100001', thread_ts=root_ts,
+                subtype='file_share', files=files)))
+            self.assertIn('首版暂不读取附件', self.state.inbox()[-1]['body'])
+
+    def test_root_normalization_preserves_literal_and_other_recipient_boundaries(self):
+        for prefix in ('', '<@UBOT> '):
+            for body in ('<root>检查</root>', '&lt;root&gt;检查&lt;/root&gt;'):
+                with self.subTest(prefix=prefix, body=body):
+                    self.assertEqual(normalize_message(prefix + body, 'UBOT'), ('<root>检查</root>', 'root'))
+        texts = (
+            '&lt;@UBOT&gt; &lt;root&gt;检查&lt;/root&gt;',
+            '&lt;@UBOT|老五&gt; <root>检查</root>',
+            '<@UBOT|老五> <root>检查</root>',
+            '<@UBOT|另一位> &lt;root&gt;检查&lt;/root&gt;',
+            '<@UBOT> &lt;@UBOT&gt; <root>检查</root>',
+            '<@UBOT> <@UOTHER> <root>检查</root>',
+            '<@UBOT> <@UBOT> <root>检查</root>',
+            '<@UOTHER|老五> <root>检查</root>',
+            '<@UBOT> `<root>检查</root>`',
+            '<@UBOT> ```\n<root>检查</root>\n```',
+            '> <@UBOT> <root>检查</root>',
+            '&gt; <@UBOT|老五> &lt;root&gt;检查&lt;/root&gt;',
+            '<@UBOT> 引用 <root>检查</root>',
+        )
+        for text in texts:
+            with self.subTest(text=text):
+                self.assertEqual(normalize_message(text, 'UBOT')[1], 'normal')
+        # DM delivery must not promote an escaped example to a maintenance request.
+        self.assertTrue(self.gateway.ingest(self.event(texts[0], channel='DONE')))
+        self.assertEqual(self.state.inbox()[0]['context'], 'normal')
+        self.assertTrue(self.state.inbox()[0]['body'].startswith('<@UBOT>'))
 
     def test_root_only_whole_owner_message_and_credentials_redacted(self):
         self.gateway.ingest(self.event('<@UBOT> &lt;root&gt;检查配置&lt;/root&gt;'))
@@ -330,6 +526,43 @@ class GatewayTests(unittest.TestCase):
         self.gateway._stop_event('TONE', 'CONE', source['reply_ts'], 'old-stop', '100.000001')
         self.assertEqual(self.gateway._input(source['id'])['status'], 'processing')
 
+    def test_manually_cancelled_inputs_stay_cancelled_after_duplicates_and_recovery(self):
+        root_ts = '1783000000.000001'
+        originals = []
+        for index, text in enumerate(('<@UOTHER> 旧版误接收', '<@UBOT> <@UOTHER> 一起处理')):
+            payload = self.event(text, ts=f'178300000{index + 1}.100001', thread_ts=root_ts)
+            originals.append(payload['event'])
+            # Seed a legacy inbox entry; production history is never touched.
+            source = self.state.enqueue('TONE', 'CONE', payload['event']['ts'], text,
+                                        reply_ts=root_ts, event_id=payload['event_id'])
+            self.state.engage('TONE', 'CONE', root_ts)
+            self.state.update_input(source['id'], status='processing')
+            self.gateway.active[('TONE', 'CONE')] = source
+            self.assertTrue(self.gateway.ingest(self.event(
+                '', kind='agent_session_stopped', ts=payload['event']['ts'],
+                thread_ts=root_ts, event_ts=str(time.time() + 1))))
+            self.assertEqual(self.gateway._input(source['id'])['error'], 'user_stopped')
+        self.gateway.active.clear()
+        before = self.state.inbox()
+        self.state.recover()
+        for original in originals:
+            for kind in ('message', 'app_mention'):
+                self.assertFalse(self.gateway.ingest(self.event(
+                    original['text'], ts=original['ts'], thread_ts=root_ts, kind=kind)))
+        # Exercise a repeated history page with a lagging synthetic watermark.
+        self.state.update_channel('TONE', 'CONE', last_ts=root_ts)
+        self.gateway.clock = lambda: 1783000010
+        self.api.messages = originals + [{'ts': '1783000003.100001', 'user': 'UOWNER',
+                                         'text': '<@UOTHER> 新请求', 'thread_ts': root_ts}]
+        self.gateway.backfill()
+        self.assertEqual(self.state.inbox(), before)
+        self.gateway.tick()
+        self.assertEqual([row['status'] for row in self.state.inbox()], ['cancelled', 'cancelled'])
+        self.assertEqual([row['error'] for row in self.state.inbox()], ['user_stopped', 'user_stopped'])
+        self.assertEqual(self.state.outputs(), [])
+        self.assertEqual(FakeSession.created, [])
+        self.assertEqual(self.api.posts, [])
+
     def test_pause_keeps_new_input_and_output_durable_without_model(self):
         self.gateway.ingest(self.event('<@UBOT> 队列任务'))
         source = self.state.inbox()[0]
@@ -467,6 +700,26 @@ class GatewayTests(unittest.TestCase):
         self.gateway.socket_request(client, request)
         self.assertEqual(len(sent), 1)
         self.state.enqueue = original
+
+    def test_socket_ack_for_other_recipient_does_not_create_channel_or_work(self):
+        try:
+            from slack_sdk import WebClient
+        except ImportError:
+            self.skipTest('官方Slack SDK未安装')
+        self.api.client = WebClient(token='xoxb-unit-test', retry_handlers=[])
+        self.gateway.build_bolt()
+        sent = []
+        client = SimpleNamespace(send_socket_mode_response=lambda response: sent.append(response.envelope_id))
+        before = self.routing_snapshot()
+        for kind in ('message', 'app_mention'):
+            request = SimpleNamespace(type='events_api', envelope_id='ignored-' + kind,
+                                      payload=self.event('<@UOTHER> 请处理', kind=kind))
+            self.gateway.socket_request(client, request)
+        self.assertEqual(sent, ['ignored-message', 'ignored-app_mention'])
+        self.assertEqual(self.routing_snapshot(), before)
+        self.gateway.tick()
+        self.assertEqual(FakeSession.created, [])
+        self.assertEqual(self.api.posts, [])
 
 
 class SlackAPIUnitTests(unittest.TestCase):
