@@ -26,7 +26,7 @@
 .venv/bin/python -m unittest discover -s tests -p 'test_p1_*.py' -v
 ```
 
-`test_p1_*` 覆盖遗忘水位与新旧快照往返、停止时上游和本地取消分别失败、交接解析的有界内存增长，以及 guardian/进程组监管进程被强杀后的清理。进程测试只运行本地 Python 假 CLI，包含忽略 SIGTERM 的工具、身份落盘前禁止 exec、PID 复用及 pidfd 不可用时拒绝启动；不调用模型或 Slack。归属未知的组须保持占位，不以“没有找到组长”冒充已经清理。
+`test_p1_*` 覆盖遗忘水位与新旧快照往返、停止时上游和本地取消分别失败、交接解析的有界内存增长，以及 guardian/进程组监管进程被强杀后的清理。进程测试只运行本地 Python 假 CLI，包含忽略 SIGTERM 的工具、身份落盘前禁止 exec、PID 复用，以及真实子进程中模拟 pidfd 缺失的兼容路径；不调用模型或 Slack。无 pidfd 的组清理只允许组内进程操作自身组，或 guardian 持有未回收直接子的证据（使用 WNOWAIT，且无其他 reaper、SIGCHLD 为默认处理）；已回收或身份不符必须拒绝。归属未知的组须保持占位，不以“没有找到组长”冒充已经清理。这里只在 Linux 验证，不能将模拟能力缺失等同真实旧内核或原生 Mac 验证。
 
 `tests/fixtures/phase1_schema2.sql` 是合成旧布局 fixture，必须随源码发布。测试中的虚构令牌和身份用于拒绝/脱敏回归，不能用于认证；不要为复现实验替换成真实凭据。Slack 资格恢复的受测配方见 [slack-recovery.md](slack-recovery.md)。
 

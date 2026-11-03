@@ -8,6 +8,8 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,21 +23,23 @@ FAKE = '''import json,os,signal,subprocess,sys,time
 from pathlib import Path
 directory=Path(sys.argv[1]); mode=sys.argv[2]
 sys.stdin.read()
-tool_program='import signal,time;from pathlib import Path;signal.signal(signal.SIGTERM,signal.SIG_IGN);Path('+repr(str(directory/'tool.ready'))+').touch();time.sleep(30)'
+handler='lambda *a:(Path('+repr(str(directory/'term.received'))+').touch(),sys.exit(0))' if mode=='term_handler' else 'signal.SIG_IGN'
+tool_program='import signal,time,sys;from pathlib import Path;signal.signal(signal.SIGTERM,'+handler+');Path('+repr(str(directory/'tool.ready'))+').touch();time.sleep(30)'
 tool=subprocess.Popen([sys.executable,'-c',tool_program])
 while not (directory/'tool.ready').exists():time.sleep(0.005)
 (directory/'ready.json').write_text(json.dumps({'cli':os.getpid(),'tool':tool.pid}))
 print(json.dumps({'type':'thread.started','thread_id':'fake'}),flush=True)
-if mode=='exit':
-    result=dict(result='ok',artifacts=[],validation=[],unfinished=[],memory_candidates=[])
+if mode in ('exit','big_exit','exit7'):
+    result=dict(result='x'*100000 if mode=='big_exit' else 'ok',artifacts=[],validation=[],unfinished=[],memory_candidates=[])
     print(json.dumps({'type':'item.completed','item':{'type':'agent_message','phase':'final','text':json.dumps(result)}}),flush=True)
     print(json.dumps({'type':'turn.completed','usage':{}}),flush=True)
+    if mode=='exit7':sys.exit(7)
 else:
     time.sleep(30)
 '''
 
 
-@unittest.skipUnless(sys.platform.startswith('linux'), 'Linux process identity and pidfds')
+@unittest.skipUnless(sys.platform.startswith('linux'), 'Linux process identity and waitid')
 class GuardianTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='laowu-p1-guardian-')
@@ -85,6 +89,48 @@ class GuardianTests(unittest.TestCase):
         with self.store.connect() as db:
             run=dict(db.execute('SELECT * FROM runs WHERE task_id=?',(task['id'],)).fetchone())
         return manager,task,run,metadata
+
+    @contextmanager
+    def without_pidfds(self, *, missing=False, dynamic=False, waitid_denied=False):
+        # This hook runs in the actual guardian, anchor, CLI and tool processes.
+        # Keep any pre-existing safety sitecustomize (e.g. network/model guard).
+        hook=self.root/'capability-hook'
+        hook.mkdir()
+        marker=self.root/'deny-pidfd'
+        if not dynamic:
+            marker.touch()
+        (hook/'sitecustomize.py').write_text('''import errno,os,runpy,signal,sys
+from pathlib import Path
+for entry in sys.path:
+    candidate=Path(entry)/'sitecustomize.py'
+    if candidate.is_file() and candidate.resolve()!=Path(__file__).resolve():
+        runpy.run_path(str(candidate),run_name='_inherited_safety_hook')
+        break
+marker=Path('''+repr(str(marker))+''')
+original_open=getattr(os,'pidfd_open',None)
+original_send=getattr(signal,'pidfd_send_signal',None)
+def denied(fn,*args,**kwargs):
+    if marker.exists() or fn is None:raise OSError(errno.ENOSYS,'synthetic old Linux')
+    return fn(*args,**kwargs)
+os.pidfd_open=lambda *a,**kw:denied(original_open,*a,**kw)
+signal.pidfd_send_signal=lambda *a,**kw:denied(original_send,*a,**kw)
+'''+("del os.pidfd_open\ndel signal.pidfd_send_signal\n" if missing else '')
+            +("def no_waitid(*a,**kw):raise PermissionError('synthetic waitid denial')\nos.waitid=no_waitid\n" if waitid_denied else ''))
+        original_open=os.pidfd_open
+        original_send=signal.pidfd_send_signal
+        def denied(fn,*args,**kwargs):
+            if marker.exists():
+                raise OSError('synthetic old Linux')
+            return fn(*args,**kwargs)
+        path=str(hook)+os.pathsep+os.environ.get('PYTHONPATH','')
+        with patch.dict(os.environ,{'PYTHONPATH':path}), \
+                patch('laowu.common.os.pidfd_open',side_effect=lambda *a,**kw:denied(original_open,*a,**kw)), \
+                patch('laowu.common.signal.pidfd_send_signal',side_effect=lambda *a,**kw:denied(original_send,*a,**kw)):
+            if waitid_denied:
+                with patch('laowu.worker.os.waitid',side_effect=PermissionError('synthetic waitid denial')):
+                    yield marker
+            else:
+                yield marker
 
     def assert_tools_dead(self):
         self.until(lambda:all(not process_alive(pid,identity) for pid,identity in self.live.items()))
@@ -226,26 +272,152 @@ class GuardianTests(unittest.TestCase):
         with patch('laowu.common.os.pidfd_open',return_value=123),patch('laowu.common.os.close'),patch('laowu.common.signal.pidfd_send_signal',side_effect=PermissionError()):
             self.assertFalse(signal_process(os.getpid(),process_identity(os.getpid()),signal.SIGTERM))
 
-    def test_missing_pidfd_capability_refuses_cli_before_fork(self):
-        reader,writer=os.pipe()
-        os.write(writer,b'1')
-        os.close(writer)
-        marker=self.root/'must-not-run'
-        program='''import json,sys
-from unittest.mock import patch
-from laowu.common import run_process_group
-with patch('laowu.common.os.pidfd_open',side_effect=PermissionError()),patch('laowu.common.os.fork',side_effect=AssertionError('must not fork')) as fork:
-    code=run_process_group(int(sys.argv[1]),sys.argv[2],sys.argv[3:])
-    assert not fork.called
-    print(json.dumps({'code':code}))
-'''
+    def test_no_pidfd_cli_exit_cleans_sigterm_ignoring_tool_and_keeps_success(self):
+        self.mode='exit'
+        with self.without_pidfds():
+            manager,task,_,_=self.start()
+            self.assertEqual(manager.wait(task['id'],8)['status'],'completed')
+            self.assert_tools_dead()
+
+    def test_no_pidfd_large_handoff_is_fully_drained(self):
+        self.mode='big_exit'
+        with self.without_pidfds(missing=True):
+            manager,task,_,_=self.start()
+            result=manager.wait(task['id'],8)
+            self.assertEqual(result['status'],'completed')
+            self.assertEqual(len(result['result']['result']),100000)
+            self.assert_tools_dead()
+
+    def test_no_pidfd_preserves_nonzero_cli_exit(self):
+        self.mode='exit7'
+        with self.without_pidfds():
+            manager,task,_,_=self.start()
+            result=manager.wait(task['id'],8)
+            self.assertEqual(result['error'],'cli_exit_7')
+            self.assertEqual(result['runs'][0]['diagnostics']['exit_code'],7)
+            self.assert_tools_dead()
+
+    def test_no_pidfd_guardian_sigkill_stops_group(self):
+        with self.without_pidfds():
+            manager,task,run,_=self.start()
+            os.kill(run['supervisor_pid'],signal.SIGKILL)
+            self.until(lambda:task_record(self.store,task['id'])['status']=='interrupted')
+            self.assert_tools_dead()
+
+    def test_no_pidfd_anchor_sigkill_uses_unreaped_child_pin(self):
+        with self.without_pidfds():
+            manager,task,run,_=self.start()
+            os.kill(run['child_pid'],signal.SIGKILL)
+            result=manager.wait(task['id'],8)
+            self.assertEqual(result['status'],'failed')
+            self.assertNotEqual(result['runs'][0]['diagnostics']['exit_code'],0)
+            self.assert_tools_dead()
+
+    def test_no_pidfd_cancel_stops_group(self):
+        with self.without_pidfds():
+            manager,task,_,_=self.start()
+            cancel_task(self.store,task['id'])
+            self.assert_tools_dead()
+            manager.close()
+
+    def test_no_pidfd_close_stops_group(self):
+        with self.without_pidfds():
+            manager,_,_,_=self.start()
+            manager.close()
+            self.assert_tools_dead()
+
+    def test_pidfds_disappearing_during_work_still_stop_group(self):
+        with self.without_pidfds(dynamic=True) as marker:
+            manager,task,_,_=self.start()
+            marker.touch()
+            cancel_task(self.store,task['id'])
+            self.assert_tools_dead()
+
+    def test_no_pidfd_graceful_sigterm_handler_runs_before_hard_stop(self):
+        self.mode='term_handler'
+        with self.without_pidfds():
+            manager,task,_,_=self.start()
+            cancel_task(self.store,task['id'])
+            self.assert_tools_dead()
+            self.assertTrue((self.root/'term.received').exists())
+
+    def test_waitid_denied_pidfd_backend_still_completes(self):
+        self.mode='exit'
+        with self.without_pidfds(dynamic=True,waitid_denied=True):
+            manager,task,_,_=self.start()
+            self.assertEqual(manager.wait(task['id'],8)['status'],'completed')
+            self.assert_tools_dead()
+
+    def test_both_pin_backends_denied_never_executes_cli(self):
+        with self.without_pidfds(waitid_denied=True):
+            manager=Manager(self.store)
+            self.managers.append(manager)
+            task=manager.submit('engineer','pin capabilities unavailable',self.root)
+            self.assertEqual(manager.wait(task['id'],8)['status'],'failed')
+            self.assertFalse((self.root/'ready.json').exists())
+
+    def owned_anchor(self):
+        process=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],start_new_session=True)
+        process._laowu_parent=os.getpid()
+        process._laowu_reaped=False
+        process._laowu_identity=process_identity(process.pid,include_zombie=True)
+        process._laowu_manifest=self.root/'missing-group.json'
+        return process
+
+    def test_wrong_identity_or_foreign_parent_never_uses_numeric_fallback(self):
+        from laowu.worker import stop_group
+        process=self.owned_anchor()
         try:
-            process=subprocess.run([sys.executable,'-c',program,str(reader),str(self.root/'group.json'),sys.executable,'-c',f'open({str(marker)!r},"w").close()'],pass_fds=(reader,),start_new_session=True,capture_output=True,text=True,timeout=5)
-            self.assertEqual(process.returncode,0,process.stderr)
-            self.assertEqual(json.loads(process.stdout),{'code':1})
-            self.assertFalse(marker.exists())
+            identity=process._laowu_identity
+            for changes in ({'_laowu_identity':'reused'}, {'_laowu_parent':99999999}):
+                process._laowu_identity=identity
+                process._laowu_parent=os.getpid()
+                for key,value in changes.items():setattr(process,key,value)
+                with patch('laowu.worker.os.killpg') as send:
+                    self.assertFalse(stop_group(process))
+                send.assert_not_called()
         finally:
-            os.close(reader)
+            process.kill()
+            process.wait(timeout=5)
+
+    def test_reaped_child_or_nondefault_sigchld_refuses_numeric_fallback(self):
+        from laowu.worker import stop_group
+        process=self.owned_anchor()
+        try:
+            with patch('laowu.worker.signal.getsignal',return_value=signal.SIG_IGN),patch('laowu.worker.os.killpg') as send:
+                self.assertFalse(stop_group(process))
+            send.assert_not_called()
+            process.kill()
+            process.wait(timeout=5)
+            with patch('laowu.worker.os.killpg') as send:
+                self.assertFalse(stop_group(process))
+            send.assert_not_called()
+        finally:
+            if process.poll() is None:process.kill()
+            process.wait(timeout=5)
+
+    def test_exit_manifest_requires_matching_identity_and_verified_cleanup(self):
+        from laowu.worker import cli_exit_code
+        path=self.root/'exit.json'
+        process=SimpleNamespace(pid=123,_laowu_identity='identity',_laowu_manifest=path,_laowu_clean=True)
+        valid=dict(anchor_pid=123,anchor_identity='identity',self_cleanup=True,cli_exit_code=0)
+        for changes in ({'anchor_pid':999},{'anchor_identity':'reused'},{'cli_exit_code':True},{'self_cleanup':False}):
+            path.write_text(json.dumps({**valid,**changes}))
+            self.assertEqual(cli_exit_code(process,-signal.SIGKILL),-signal.SIGKILL)
+        path.write_text(json.dumps(valid))
+        self.assertEqual(cli_exit_code(process,-signal.SIGKILL),0)
+        process._laowu_clean=False
+        self.assertEqual(cli_exit_code(process,-signal.SIGKILL),-signal.SIGKILL)
+        path.write_text('bad json')
+        process._laowu_clean=True
+        self.assertEqual(cli_exit_code(process,-signal.SIGKILL),-signal.SIGKILL)
+
+    def test_signal_success_with_surviving_members_stays_pending(self):
+        from laowu.worker import stop_group
+        process=SimpleNamespace(pid=123,_laowu_identity='identity',_laowu_manifest=self.root/'missing',wait=unittest.mock.Mock())
+        with patch('laowu.worker.anchor_status',return_value=-9),patch('laowu.common.stop_process_group',return_value=False),patch('laowu.worker.os.killpg'),patch('laowu.common.group_members',return_value={456:'alive'}),patch('laowu.worker.time.sleep'),patch('laowu.worker.time.monotonic',side_effect=[0,2]):
+            self.assertFalse(stop_group(process))
+        process.wait.assert_not_called()
 
     def test_group_snapshot_uses_one_stat_for_group_and_identity(self):
         # A second stat read could refer to a reused PID in another group.
@@ -265,6 +437,6 @@ with patch('laowu.common.os.pidfd_open',side_effect=PermissionError()),patch('la
             identity='anchor' if not calls else 'tool'
             return '12 (synthetic) '+' '.join([*fields,identity])
         states=iter([{10:'boot:anchor',11:'boot:cli',12:'boot:tool'},{12:'boot:tool'},{12:'boot:tool'},{}])
-        with patch('laowu.common.group_members',side_effect=lambda pgid:next(states,{})),patch('laowu.common.process_identity',return_value=None),patch.object(Path,'read_text',read),patch('laowu.common.signal_process',side_effect=lambda *args:calls.append(args)),patch('laowu.common.time.sleep'):
+        with patch('laowu.common.group_members',side_effect=lambda pgid:next(states,{})),patch('laowu.common.process_identity',return_value=None),patch.object(Path,'read_text',read),patch('laowu.common.signal_process',side_effect=lambda *args:(calls.append(args) or True)),patch('laowu.common.time.sleep'):
             self.assertTrue(stop_process_group(10,'boot:anchor'))
         self.assertTrue(any(pid==12 for pid,identity,signum in calls))

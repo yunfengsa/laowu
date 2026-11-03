@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import selectors
+import select
 import signal
 import subprocess
 import sys
@@ -63,10 +64,71 @@ def handoff(text: str) -> dict:
     raise ValueError("invalid_handoff")
 
 
+def anchor_status(process):
+    """Peek at our own unreaped child; never publish Popen.returncode here."""
+    if (getattr(process, '_laowu_parent', None) != os.getpid()
+            or getattr(process, '_laowu_reaped', False)
+            or signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL):
+        raise ChildProcessError('anchor_ownership_unavailable')
+    if getattr(process, '_laowu_backend', None) == 'pidfd':
+        if process_identity(process.pid, include_zombie=True) != process._laowu_identity:
+            raise ChildProcessError('anchor_identity_changed')
+        return 0 if select.select([process._laowu_pidfd], [], [], 0)[0] else None
+    # ECHILD means another reaper/auto-reaping invalidated the direct-child pin.
+    try:
+        value = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        raise
+    except (PermissionError, OSError, AttributeError) as exc:
+        import errno
+        if getattr(exc, 'errno', None) == errno.ECHILD:
+            raise ChildProcessError('anchor_ownership_unavailable') from None
+        # A sandbox may block waitid while allowing pidfds. This backend never
+        # enables numeric group signals: only a verified WNOWAIT child can do so.
+        fd = os.pidfd_open(process.pid)
+        try:
+            if process_identity(process.pid, include_zombie=True) != process._laowu_identity:
+                raise ChildProcessError('anchor_identity_changed')
+            signal.pidfd_send_signal(fd, 0)
+        except BaseException:
+            os.close(fd)
+            raise
+        process._laowu_backend, process._laowu_pidfd = 'pidfd', fd
+        return 0 if select.select([fd], [], [], 0)[0] else None
+    if process_identity(process.pid, include_zombie=True) != process._laowu_identity:
+        raise ChildProcessError('anchor_identity_changed')
+    if value is None:
+        return None
+    return value.si_status if value.si_code == os.CLD_EXITED else -value.si_status
+
+
+def cli_exit_code(process, observed):
+    if observed != -signal.SIGKILL or not getattr(process, '_laowu_clean', False):
+        return observed
+    try:
+        with process._laowu_manifest.open() as stream:
+            manifest = json.loads(stream.read(4097))
+        code = manifest['cli_exit_code']
+        if (manifest['anchor_pid'] == process.pid
+                and manifest['anchor_identity'] == process._laowu_identity
+                and manifest.get('self_cleanup') is True
+                and type(code) is int and -64 <= code <= 255):
+            return code
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return observed
+
+
 def stop_group(process):
     if process is None:
         return True
-    from .common import stop_process_group
+    if getattr(process, '_laowu_clean', False):
+        return True
+    from .common import group_members, stop_process_group
+    try:
+        anchor_status(process)
+    except (ChildProcessError, OSError, AttributeError):
+        return False
     witnesses = []
     try:
         manifest = json.loads(process._laowu_manifest.read_text())
@@ -76,10 +138,32 @@ def stop_group(process):
     except (OSError, ValueError, KeyError, AttributeError):
         pass
     clean = stop_process_group(process.pid, process._laowu_identity, witnesses)
-    try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        pass
+    if not clean:
+        try:
+            # Only this directly owned child is eligible: WNOWAIT keeps even
+            # its zombie PID allocated until AFTER all group members are gone.
+            anchor_status(process)
+            if getattr(process, '_laowu_backend', None) == 'pidfd':
+                return False
+            os.killpg(process.pid, signal.SIGTERM)
+            time.sleep(0.2)
+            anchor_status(process)
+            os.killpg(process.pid, signal.SIGKILL)
+            deadline = time.monotonic() + 1
+            while group_members(process.pid) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            clean = not group_members(process.pid)
+        except ProcessLookupError:
+            clean = not group_members(process.pid)
+        except (ChildProcessError, OSError, AttributeError):
+            clean = False
+    if clean:
+        try:
+            process._laowu_exit_code = process.wait(timeout=1)
+            process._laowu_reaped = True
+            process._laowu_clean = True
+        except subprocess.TimeoutExpired:
+            clean = False
     return clean
 
 
@@ -136,19 +220,24 @@ def run(store, run_id: str, lease_fd: int) -> int:
         # No real CLI executes before its group identity is durably registered.
         argv = [sys.executable, str(Path(__file__).with_name('common.py')),
                 str(gate_read), str(manifest), *config['argv']]
+        if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+            raise RuntimeError('guardian_requires_default_sigchld')
         process = subprocess.Popen(argv, cwd=config["cwd"], env=environment,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True, close_fds=True, pass_fds=(gate_read,))
         os.close(gate_read)
         gate_read = None
-        process._laowu_identity = process_identity(process.pid)
+        process._laowu_parent = os.getpid()
+        process._laowu_reaped = False
+        process._laowu_identity = process_identity(process.pid, include_zombie=True)
         process._laowu_manifest = manifest
         with store.transaction() as db:
             permitted = db.execute("SELECT 1 FROM runs r JOIN sessions s ON s.id=r.session_id WHERE r.id=? AND r.status IN ('starting','running') AND s.status='active'", (run_id,)).fetchone()
             db.execute("UPDATE runs SET status=CASE WHEN status='starting' THEN 'running' ELSE status END,child_pid=?,child_identity=?,updated_at=? WHERE id=?",
                        (process.pid, process._laowu_identity, now(), run_id))
             db.execute('INSERT OR IGNORE INTO run_cleanup VALUES(?)', (run_id,))
-        if permitted and process._laowu_identity:
+        live_anchor = anchor_status(process) is None
+        if permitted and process._laowu_identity and live_anchor:
             os.write(gate_write, b'1')
         else:
             interrupted = True
@@ -167,6 +256,8 @@ def run(store, run_id: str, lease_fd: int) -> int:
         deadline = time.monotonic() + 3600
         last_check = 0.0
         event_count = 0
+        observed_exit = None
+        exit_code = None
 
         def consume(line):
             nonlocal output_size, failure, cli_session_id, event_count, pending_error, terminal_error
@@ -246,11 +337,15 @@ def run(store, run_id: str, lease_fd: int) -> int:
                                (event_count, cli_session_id, now(), run_id))
                 best_effort(monitor.observe, run_id,heartbeat=True)
                 last_check = time.monotonic()
-            if process.poll() is not None and not any(k.data in {"stdout", "stderr"} for k in selector.get_map().values()):
-                break
-            if process.poll() not in (None, 0):
-                # A killed anchor can leave inherited pipes open in CLI/tools.
-                # Do not wait for EOF before recovering its recorded group.
+            if observed_exit is None:
+                observed_exit = anchor_status(process)
+                if observed_exit is not None:
+                    if not stop_group(process):
+                        failure = 'cleanup_pending'
+                        break
+                    observed_exit = process._laowu_exit_code
+                    exit_code = cli_exit_code(process, observed_exit)
+            if observed_exit is not None and not any(k.data in {"stdout", "stderr"} for k in selector.get_map().values()):
                 break
         if buffer:
             consume(buffer)
@@ -258,18 +353,18 @@ def run(store, run_id: str, lease_fd: int) -> int:
             failure = "timeout"
         if interrupted:
             failure = "interrupted"
-        elif process.poll() is None:
+        elif observed_exit is None:
             failure = failure or "process_incomplete"
-        elif process.returncode != 0:
-            failure = failure or f"cli_exit_{process.returncode}"
-        diagnostics.update(exit_code=process.poll(), stderr_bytes=stderr.byte_count)
+        elif exit_code != 0:
+            failure = failure or f"cli_exit_{exit_code}"
+        diagnostics.update(exit_code=exit_code, stderr_bytes=stderr.byte_count)
         observed = terminal_error or pending_error
         if observed is None or observed["category"] == "unknown":
             if stderr.diagnostic:
                 observed = {"source": "stderr", **stderr.diagnostic}
         if observed:
             diagnostics["last_error"] = observed
-        if not interrupted and (terminal_error or pending_error or process.returncode not in (None, 0)):
+        if not interrupted and (terminal_error or pending_error or exit_code not in (None, 0)):
             if failure is None or failure.startswith("cli_exit_"):
                 failure = error_code(observed) if observed else failure
         result = None
@@ -311,6 +406,8 @@ def run(store, run_id: str, lease_fd: int) -> int:
                     if stream:
                         best_effort(stream.close)
             best_effort(os.close, lease_fd)
+            if process and hasattr(process, '_laowu_pidfd'):
+                best_effort(os.close, process._laowu_pidfd)
             import shutil
             if clean and folder.is_dir():
                 shutil.rmtree(folder, ignore_errors=True)

@@ -40,12 +40,12 @@ def json_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
 
 
-def process_identity(pid: int) -> str | None:
+def process_identity(pid: int, *, include_zombie=False) -> str | None:
     """Linux PID start ticks prevent PID reuse from granting run ownership."""
     try:
         text = Path(f"/proc/{int(pid)}/stat").read_text()
         fields = text[text.rfind(")") + 2:].split()
-        if fields[0] == "Z":
+        if fields[0] == "Z" and not include_zombie:
             return None
         boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         return f"{boot}:{fields[19]}"
@@ -133,8 +133,11 @@ def stop_process_group(pgid: int, identity: str, witnesses=(), *, exclude_self=F
         return False
     for signum, grace in ((signal.SIGTERM, 0.2), (signal.SIGKILL, 0.5)):
         # The anchor goes last, retaining group ownership while stopping tools.
+        signalled = False
         for pid, ident in sorted(members.items(), key=lambda item: item[0] == pgid):
-            signal_process(pid, ident, signum)
+            signalled = signal_process(pid, ident, signum) or signalled
+        if members and not signalled:
+            return False
         deadline = time.monotonic() + grace
         while members and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -155,10 +158,9 @@ def run_process_group(gate_fd: int, manifest: str, argv: list[str]) -> int:
     import select
     if os.read(gate_fd, 1) != b'1':
         return 1
-    # Refuse to exec work that this kernel/sandbox cannot safely revoke. This
-    # happens before even forking the gated CLI, so denial cannot strand tools.
     identity = process_identity(os.getpid())
-    if not identity or not signal_process(os.getpid(), identity, 0):
+    # The final fallback can kill ONLY this private group, never the caller's.
+    if not identity or os.getpgrp() != os.getpid():
         os.close(gate_fd)
         return 1
     stopped = False
@@ -184,12 +186,14 @@ def run_process_group(gate_fd: int, manifest: str, argv: list[str]) -> int:
         os._exit(127)
     os.close(reader)
     status = None
+    recorded = None
     try:
         child_identity = process_identity(child)
         if not identity or not child_identity:
             raise RuntimeError('group_identity_unavailable')
-        atomic_write(Path(manifest), json.dumps({'anchor_pid': os.getpid(), 'anchor_identity': identity,
-                                               'members': [[child, child_identity]]}))
+        recorded = {'anchor_pid': os.getpid(), 'anchor_identity': identity,
+                    'members': [[child, child_identity]]}
+        atomic_write(Path(manifest), json.dumps(recorded))
         os.write(writer, b'1')
         os.close(writer)
         writer = None
@@ -211,6 +215,20 @@ def run_process_group(gate_fd: int, manifest: str, argv: list[str]) -> int:
         if writer is not None:
             os.close(writer)
         clean = stop_process_group(os.getpid(), identity, exclude_self=True) if identity else False
+        if not clean:
+            # Linux without pidfds still permits a process to revoke its OWN
+            # group without any PID-reuse race. Save only an actually observed
+            # CLI exit; the guardian must separately confirm group cleanup.
+            code = os.waitstatus_to_exitcode(status) if status is not None and not stopped else None
+            try:
+                os.killpg(os.getpid(), signal.SIGTERM)
+                time.sleep(0.2)
+                if recorded is not None and code is not None:
+                    atomic_write(Path(manifest), json.dumps({**recorded, 'self_cleanup': True,
+                        'cli_exit_code': code}))
+            finally:
+                if os.getpgrp() == os.getpid():
+                    os.killpg(os.getpid(), signal.SIGKILL)
         os.close(gate_fd)
         if status is None and clean:
             _, status = os.waitpid(child, 0)
