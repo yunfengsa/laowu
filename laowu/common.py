@@ -1,10 +1,12 @@
-"""Small deterministic utilities; never inspect or copy client credentials."""
+"""Shared utilities and private process-group control; never copy credentials."""
 from __future__ import annotations
 
 import json
 import os
 import re
 import tempfile
+import signal
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -55,6 +57,170 @@ def process_alive(pid: int | None, identity: str | None) -> bool:
     return bool(pid and identity and process_identity(pid) == identity)
 
 
+def group_members(pgid: int) -> dict[int, str]:
+    """Return live members with start identities, never a bare list of PIDs."""
+    members = {}
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
+            # Group and start ticks must come from ONE stat snapshot: otherwise
+            # PID reuse between reads could attach an unrelated identity here.
+            if fields[0] != 'Z' and int(fields[2]) == pgid:
+                members[int(entry.name)] = f'{boot}:{fields[19]}'
+        except (OSError, ValueError, IndexError):
+            continue
+    return members
+
+
+def signal_process(pid: int, identity: str, signum: int) -> bool:
+    """Pin a Linux process before checking its start identity and signalling it."""
+    try:
+        fd = os.pidfd_open(pid)
+    except (OSError, AttributeError):
+        return False
+    try:
+        if not process_alive(pid, identity):
+            return False
+        signal.pidfd_send_signal(fd, signum)
+        return True
+    except (OSError, AttributeError):
+        return False
+    finally:
+        os.close(fd)
+
+
+def stop_process_group(pgid: int, identity: str, witnesses=(), *, exclude_self=False) -> bool:
+    """Stop only an identity-verified group; uncertain ownership stays pending.
+
+    A living group anchor or recorded CLI is required before taking each member
+    snapshot. Individual pidfds prevent PID reuse between inspection and signal.
+    """
+    witnesses = [(pgid, identity), *witnesses]
+    trusted = {}
+    def snapshot():
+        current = process_identity(pgid)
+        try:
+            all_members = group_members(pgid)
+        except OSError:
+            return None  # An unreadable /proc is unknown, not an empty group.
+        members = dict(all_members)
+        if exclude_self:
+            members.pop(os.getpid(), None)
+        if not members:
+            return {}
+        if current and current != identity:
+            # A reused numeric leader is not an ownership witness. A recorded
+            # surviving CLI/tool may still verify the original group.
+            trusted.pop(pgid, None)
+        def belongs(pid, ident):
+            try:
+                fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+                boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+                return (all_members.get(pid) == ident and fields[0] != 'Z'
+                        and int(fields[2]) == pgid and f'{boot}:{fields[19]}' == ident)
+            except (OSError, ValueError, IndexError):
+                return False
+        if not any(belongs(pid, ident) for pid, ident in [*witnesses, *trusted.items()]):
+            return None
+        trusted.update(all_members)
+        return members
+
+    members = snapshot()
+    if members is None:
+        return False
+    for signum, grace in ((signal.SIGTERM, 0.2), (signal.SIGKILL, 0.5)):
+        # The anchor goes last, retaining group ownership while stopping tools.
+        for pid, ident in sorted(members.items(), key=lambda item: item[0] == pgid):
+            signal_process(pid, ident, signum)
+        deadline = time.monotonic() + grace
+        while members and time.monotonic() < deadline:
+            time.sleep(0.01)
+            members = snapshot()
+            if members is None:
+                return False
+        if not members:
+            return True
+    return False
+
+
+def run_process_group(gate_fd: int, manifest: str, argv: list[str]) -> int:
+    """Private gated group anchor, invoked by worker.py with this absolute file.
+
+    The outer gate is a lifetime lease. A second gate prevents a real CLI exec
+    before its identity is durably available to a surviving guardian/manager.
+    """
+    import select
+    if os.read(gate_fd, 1) != b'1':
+        return 1
+    # Refuse to exec work that this kernel/sandbox cannot safely revoke. This
+    # happens before even forking the gated CLI, so denial cannot strand tools.
+    identity = process_identity(os.getpid())
+    if not identity or not signal_process(os.getpid(), identity, 0):
+        os.close(gate_fd)
+        return 1
+    stopped = False
+    def stop(*unused):
+        nonlocal stopped
+        stopped = True
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, stop)
+    reader, writer = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(writer)
+        os.close(gate_fd)
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(signum, signal.SIG_DFL)
+        ready = os.read(reader, 1)
+        os.close(reader)
+        if ready == b'1':
+            try:
+                os.execvpe(argv[0], argv, os.environ)
+            except OSError:
+                pass
+        os._exit(127)
+    os.close(reader)
+    status = None
+    try:
+        child_identity = process_identity(child)
+        if not identity or not child_identity:
+            raise RuntimeError('group_identity_unavailable')
+        atomic_write(Path(manifest), json.dumps({'anchor_pid': os.getpid(), 'anchor_identity': identity,
+                                               'members': [[child, child_identity]]}))
+        os.write(writer, b'1')
+        os.close(writer)
+        writer = None
+        # The CLI inherits the guardian's pipes. The anchor must not hold them open.
+        for fd in (0, 1, 2):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        while not stopped:
+            pid, status = os.waitpid(child, os.WNOHANG)
+            if pid:
+                break
+            status = None
+            ready, _, _ = select.select([gate_fd], [], [], 0.05)
+            if ready and not os.read(gate_fd, 1):
+                stopped = True
+    finally:
+        if writer is not None:
+            os.close(writer)
+        clean = stop_process_group(os.getpid(), identity, exclude_self=True) if identity else False
+        os.close(gate_fd)
+        if status is None and clean:
+            _, status = os.waitpid(child, 0)
+    code = os.waitstatus_to_exitcode(status) if status is not None and not stopped else 1
+    if code < 0:
+        signal.signal(-code, signal.SIG_DFL)
+        os.kill(os.getpid(), -code)
+    return code
+
+
 def valid_id(value: str) -> str:
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value):
         raise ValueError("ID 必须使用小写字母、数字、下划线或短横线，最多 64 字符")
@@ -69,3 +235,8 @@ def project_root(value: str | Path | None = None) -> Path:
     else:
         root = Path(__file__).resolve().parent.parent
     return root
+
+
+if __name__ == '__main__':
+    import sys
+    raise SystemExit(run_process_group(int(sys.argv[1]), sys.argv[2], sys.argv[3:]))

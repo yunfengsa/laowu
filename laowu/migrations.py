@@ -182,14 +182,19 @@ def runtime_prepare(store):
             columns={r[1] for r in db.execute('PRAGMA table_info('+table+')')}
             if columns and 'diagnostics' not in columns:
                 missing.append(table)
-        if meta and not missing:
+        groups_missing = (bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='runs'").fetchone())
+                          and not db.execute("SELECT 1 FROM sqlite_master WHERE name='run_cleanup'").fetchone())
+        if meta and not missing and not groups_missing:
             return
-        if missing:
+        if missing or groups_missing:
             store._backup_locked(db)
         db.execute('BEGIN IMMEDIATE')
         try:
             for table in missing:
                 db.execute('ALTER TABLE '+table+" ADD COLUMN diagnostics TEXT NOT NULL DEFAULT '{}' ")
+            if groups_missing:
+                db.execute('CREATE TABLE run_cleanup (run_id TEXT PRIMARY KEY)')
+                db.execute('INSERT INTO run_cleanup SELECT id FROM runs WHERE child_pid IS NOT NULL')
             db.execute('CREATE TABLE IF NOT EXISTS runtime_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
             db.execute("INSERT OR REPLACE INTO runtime_meta VALUES('schema_version','1')")
             db.commit()

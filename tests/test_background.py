@@ -62,8 +62,9 @@ class BackgroundTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def connect(self, name):
-        self.presence.connect('connection-' + name, name, mode='lease', ttl=30)
+    def connect(self, name, *, connected_at=None):
+        self.presence.connect('connection-' + name, name, mode='lease', ttl=30,
+                              connected_at=connected_at)
         self.bridge.states[name] = 'idle'
 
     def ready(self, event):
@@ -74,8 +75,8 @@ class BackgroundTests(unittest.TestCase):
         event = self.box.publish('中文结果', event_key='once')
         self.dispatcher.tick()
         self.assertEqual(self.bridge.sent, [])
-        self.connect('old')
-        self.connect('new')
+        self.connect('old', connected_at='2020-01-01T00:00:00+00:00')
+        self.connect('new', connected_at='2020-01-02T00:00:00+00:00')
         Dispatcher(Store(self.root), lambda: self.bridge).tick()
         self.assertEqual(self.bridge.sent[0]['target_thread'], 'new')
         self.assertEqual(self.box.get(event['id'])['status'], 'submitted')
@@ -105,8 +106,9 @@ class BackgroundTests(unittest.TestCase):
         self.assertEqual(self.presence.online({'one', 'two'}), ['two'])
 
     def test_heartbeat_does_not_change_recency(self):
-        self.connect('old')
-        self.connect('new')
+        # Explicit times avoid ties from the production millisecond clock.
+        self.connect('old', connected_at='2020-01-01T00:00:00+00:00')
+        self.connect('new', connected_at='2020-01-02T00:00:00+00:00')
         self.presence.connect('connection-old', 'old', mode='lease', ttl=30)
         self.assertEqual(self.presence.online({'old', 'new'}), ['new', 'old'])
         self.presence.disconnect('connection-old')

@@ -6,6 +6,7 @@ import os
 import selectors
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -17,45 +18,69 @@ from .diagnostics import ErrorStream, error_code
 
 def handoff(text: str) -> dict:
     decoder = json.JSONDecoder()
-    candidates = [text.strip()]
-    candidates.extend(text[i:] for i, c in enumerate(text) if c == "{")
-    for candidate in candidates:
-        try:
-            data, _ = decoder.raw_decode(candidate)
-        except ValueError:
-            continue
+
+    def validated(data):
         if not isinstance(data, dict) or not isinstance(data.get("result"), str):
-            continue
+            return None
         if not all(isinstance(data.get(k), list) and all(isinstance(s, str) for s in data[k])
                    for k in ("artifacts", "validation", "unfinished")):
-            continue
+            return None
         if not isinstance(data.get("memory_candidates"), list) or not all(isinstance(m, dict) for m in data["memory_candidates"]):
-            continue
+            return None
         json.dumps(data, allow_nan=False)  # Reject non-JSON numeric constants before persistence.
         return {key: data[key] for key in ("result", "artifacts", "validation", "unfinished", "memory_candidates")}
+
+    # Parse the normal whole response first. raw_decode accepts an index into
+    # the original string, so neither this path nor recovery copies suffixes.
+    start = 0
+    while start < len(text) and text[start].isspace():
+        start += 1
+    try:
+        data, _ = decoder.raw_decode(text, start)
+    except (ValueError, RecursionError):
+        pass
+    else:
+        result = validated(data)
+        if result is not None:
+            return result
+
+    # Recover fenced JSON or a handoff preceded by prose, but cap retries:
+    # adversarial braces must not cause an unbounded number of full parses.
+    cursor = start + 1 if start < len(text) and text[start] == "{" else 0
+    for _ in range(64):
+        cursor = text.find("{", cursor)
+        if cursor < 0:
+            break
+        try:
+            data, _ = decoder.raw_decode(text, cursor)
+        except (ValueError, RecursionError):
+            pass
+        else:
+            result = validated(data)
+            if result is not None:
+                return result
+        cursor += 1
     raise ValueError("invalid_handoff")
 
 
 def stop_group(process):
     if process is None:
-        return
+        return True
+    from .common import stop_process_group
+    witnesses = []
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
+        manifest = json.loads(process._laowu_manifest.read_text())
+        if (manifest['anchor_pid'] == process.pid
+                and manifest['anchor_identity'] == process._laowu_identity):
+            witnesses = manifest['members']
+    except (OSError, ValueError, KeyError, AttributeError):
         pass
-    try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        pass
-    # Also terminate descendants that outlive an exited group leader.
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    clean = stop_process_group(process.pid, process._laowu_identity, witnesses)
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
         pass
+    return clean
 
 
 def run(store, run_id: str, lease_fd: int) -> int:
@@ -67,6 +92,7 @@ def run(store, run_id: str, lease_fd: int) -> int:
     started_clock = time.time()
     provider_usage = {}
     process = None
+    gate_read = gate_write = None
     selector = selectors.DefaultSelector()
     interrupted = False
     failure = None
@@ -105,12 +131,27 @@ def run(store, run_id: str, lease_fd: int) -> int:
         environment = worker_environment(environment)
         environment["LAOWU_ROLE"] = "worker"
         environment["LAOWU_ROOT"] = str(store.root)
-        process = subprocess.Popen(config["argv"], cwd=config["cwd"], env=environment,
+        gate_read, gate_write = os.pipe()
+        manifest = folder / 'group.json'
+        # No real CLI executes before its group identity is durably registered.
+        argv = [sys.executable, str(Path(__file__).with_name('common.py')),
+                str(gate_read), str(manifest), *config['argv']]
+        process = subprocess.Popen(argv, cwd=config["cwd"], env=environment,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   start_new_session=True, close_fds=True)
+                                   start_new_session=True, close_fds=True, pass_fds=(gate_read,))
+        os.close(gate_read)
+        gate_read = None
+        process._laowu_identity = process_identity(process.pid)
+        process._laowu_manifest = manifest
         with store.transaction() as db:
-            db.execute("UPDATE runs SET status='running',child_pid=?,child_identity=?,updated_at=? WHERE id=? AND status='starting'",
-                       (process.pid, process_identity(process.pid), now(), run_id))
+            permitted = db.execute("SELECT 1 FROM runs r JOIN sessions s ON s.id=r.session_id WHERE r.id=? AND r.status IN ('starting','running') AND s.status='active'", (run_id,)).fetchone()
+            db.execute("UPDATE runs SET status=CASE WHEN status='starting' THEN 'running' ELSE status END,child_pid=?,child_identity=?,updated_at=? WHERE id=?",
+                       (process.pid, process._laowu_identity, now(), run_id))
+            db.execute('INSERT OR IGNORE INTO run_cleanup VALUES(?)', (run_id,))
+        if permitted and process._laowu_identity:
+            os.write(gate_write, b'1')
+        else:
+            interrupted = True
         os.set_blocking(lease_fd, False)
         selector.register(lease_fd, selectors.EVENT_READ, "lease")
         os.set_blocking(process.stdout.fileno(), False)
@@ -207,6 +248,10 @@ def run(store, run_id: str, lease_fd: int) -> int:
                 last_check = time.monotonic()
             if process.poll() is not None and not any(k.data in {"stdout", "stderr"} for k in selector.get_map().values()):
                 break
+            if process.poll() not in (None, 0):
+                # A killed anchor can leave inherited pipes open in CLI/tools.
+                # Do not wait for EOF before recovering its recorded group.
+                break
         if buffer:
             consume(buffer)
         if time.monotonic() >= deadline:
@@ -253,8 +298,12 @@ def run(store, run_id: str, lease_fd: int) -> int:
         return 1
     finally:
         # Cleanup is independent of optional observations and of each other.
+        clean = False
         try:
-            best_effort(stop_group, process)
+            for fd in (gate_read, gate_write):
+                if fd is not None:
+                    best_effort(os.close, fd)
+            clean = best_effort(stop_group, process)
         finally:
             best_effort(selector.close)
             if process:
@@ -263,7 +312,7 @@ def run(store, run_id: str, lease_fd: int) -> int:
                         best_effort(stream.close)
             best_effort(os.close, lease_fd)
             import shutil
-            if folder.is_dir():
+            if clean and folder.is_dir():
                 shutil.rmtree(folder, ignore_errors=True)
         def record_metrics():
             from .metrics import sample, seconds

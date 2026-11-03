@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import json
 import os
 import secrets
@@ -41,6 +42,51 @@ def initialize_runtime(store):
             supervisor_pid INTEGER, supervisor_identity TEXT, child_pid INTEGER,
             child_identity TEXT, cli_session_id TEXT, event_count INTEGER NOT NULL DEFAULT 0,
             error TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, diagnostics TEXT NOT NULL DEFAULT '{}')""")
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='run_cleanup'").fetchone():
+            db.execute('CREATE TABLE run_cleanup (run_id TEXT PRIMARY KEY)')
+            db.execute('INSERT INTO run_cleanup SELECT id FROM runs WHERE child_pid IS NOT NULL')
+
+
+def cleanup_runs(store, *, task_id=None, session_id=None):
+    """Reap revoked/orphan groups outside the global transaction/write lock."""
+    from .common import signal_process, stop_process_group
+    import signal
+    with contextlib.closing(store.connect()) as db:
+        rows = db.execute('''SELECT r.*,s.status AS owner_status,s.owner_pid,s.owner_identity
+            FROM runs r LEFT JOIN sessions s ON s.id=r.session_id
+            WHERE (? IS NULL OR r.task_id=?) AND (? IS NULL OR r.session_id=?)
+            AND (r.status IN ('starting','running')
+                 OR r.id IN (SELECT run_id FROM run_cleanup))''',
+            (task_id, task_id, session_id, session_id)).fetchall()
+    for run in rows:
+        supervisor_alive = process_alive(run['supervisor_pid'], run['supervisor_identity'])
+        if (run['status'] in ('starting', 'running') and supervisor_alive
+                and run['owner_status'] == 'active'
+                and process_alive(run['owner_pid'], run['owner_identity'])):
+            continue
+        if supervisor_alive and run['supervisor_pid'] != os.getpid():
+            signal_process(run['supervisor_pid'], run['supervisor_identity'], signal.SIGTERM)
+        if not run['child_pid'] or not run['child_identity']:
+            with store.transaction() as db:
+                db.execute('DELETE FROM run_cleanup WHERE run_id=?', (run['id'],))
+            continue
+        witnesses = []
+        path = store.private / 'runtime' / run['id'] / 'group.json'
+        try:
+            store._safe(path)
+            with path.open() as stream:
+                manifest = json.loads(stream.read(4097))
+            if (manifest['anchor_pid'] == run['child_pid']
+                    and manifest['anchor_identity'] == run['child_identity']):
+                witnesses = manifest['members']
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        clean = stop_process_group(run['child_pid'], run['child_identity'], witnesses)
+        with store.transaction() as db:
+            if clean:
+                db.execute('DELETE FROM run_cleanup WHERE run_id=?', (run['id'],))
+            else:
+                db.execute('INSERT OR IGNORE INTO run_cleanup VALUES(?)', (run['id'],))
 
 
 
@@ -57,18 +103,23 @@ def reconcile(store):
             if process_alive(run["supervisor_pid"], run["supervisor_identity"]):
                 continue
             session = db.execute("SELECT * FROM sessions WHERE id=?", (run["session_id"],)).fetchone()
-            if run["status"] == "starting" and session and process_alive(session["owner_pid"], session["owner_identity"]):
+            if (run["status"] == "starting" and not run['supervisor_pid'] and session
+                    and process_alive(session["owner_pid"], session["owner_identity"])):
                 continue
             db.execute("UPDATE runs SET status='interrupted',error='owner_lost',updated_at=? WHERE id=?", (now(), run["id"]))
             db.execute("UPDATE tasks SET status='interrupted',error='owner_lost',updated_at=? WHERE id=? AND status='running'", (now(), run["task_id"]))
+            if run['child_pid']:
+                db.execute('INSERT OR IGNORE INTO run_cleanup VALUES(?)', (run['id'],))
         has_async = bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='async_tasks'").fetchone())
         exclude = " AND id NOT IN (SELECT task_id FROM async_tasks)" if has_async else ''
         db.execute("""UPDATE tasks SET status='interrupted',updated_at=?
             WHERE status='queued' AND session_id IN (SELECT id FROM sessions WHERE status!='active')""" + exclude, (now(),))
+    cleanup_runs(store)
 
 
 def _run_records(db, task_id):
-    runs = db.execute("""SELECT id,status,error,event_count,cli_session_id,started_at,updated_at,diagnostics
+    runs = db.execute("""SELECT id,status,error,event_count,cli_session_id,started_at,updated_at,diagnostics,
+        EXISTS(SELECT 1 FROM run_cleanup WHERE run_id=runs.id) AS cleanup_pending
         FROM runs WHERE task_id=? ORDER BY started_at,rowid""", (task_id,)).fetchall()
     return [dict(run, diagnostics=json.loads(run["diagnostics"])) for run in runs]
 
@@ -151,6 +202,8 @@ def cancel_task(store, task_id: str, reason="cancelled"):
             db.execute("UPDATE tasks SET status=?,error=?,updated_at=? WHERE id=?", (reason, reason, now(), task_id))
             db.execute("UPDATE runs SET status=?,error=?,updated_at=? WHERE task_id=? AND status IN ('starting','running')",
                        (reason, reason, now(), task_id))
+        db.execute('INSERT OR IGNORE INTO run_cleanup SELECT id FROM runs WHERE task_id=? AND child_pid IS NOT NULL', (task_id,))
+    cleanup_runs(store, task_id=task_id)
     return task_record(store, task_id)
 
 
@@ -285,6 +338,7 @@ class Manager:
         return task_record(self.store, task_id)
 
     def resume(self, task_id):
+        reconcile(self.store)
         with self.store.transaction() as db:
             self._require_active(db)
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -311,7 +365,9 @@ class Manager:
                 if paused and paused[0] == '1':
                     return None
             candidates = db.execute("SELECT * FROM runs").fetchall()
+            pending_cleanup = {r[0] for r in db.execute('SELECT run_id FROM run_cleanup')}
             runs = [r for r in candidates if r["status"] in {"starting", "running"}
+                    or r['id'] in pending_cleanup
                     or process_alive(r["supervisor_pid"], r["supervisor_identity"])
                     or process_alive(r["child_pid"], r["child_identity"])]
             if len(runs) >= 2:
@@ -467,9 +523,11 @@ class Manager:
                 exclude = " AND id NOT IN (SELECT task_id FROM async_tasks)" if has_async and not self.background else ''
                 db.execute("UPDATE tasks SET status='interrupted',error=?,updated_at=? WHERE session_id=? AND status IN ('queued','running')" + exclude, (reason, now(), self.id))
                 db.execute("UPDATE runs SET status='interrupted',error=?,updated_at=? WHERE session_id=? AND status IN ('starting','running')", (reason, now(), self.id))
+                db.execute('INSERT OR IGNORE INTO run_cleanup SELECT id FROM runs WHERE session_id=? AND child_pid IS NOT NULL', (self.id,))
         finally:
             if not already_closed:
                 self._close_children()
+            cleanup_runs(self.store, session_id=self.id)
 
     def _close_children(self):
         with self._lock:
