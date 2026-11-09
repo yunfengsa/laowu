@@ -45,7 +45,9 @@ codex
 | 阿宁 `confidant` | 倾听、梳理心事与关系问题 | 相关个人记忆、任务检查点；无 shell |
 | 阿知 `researcher` | 调查、资料比较、核验来源 | 阅读、搜索、相关记忆、任务检查点 |
 
-每位朋友都有独立人格、技能清单、MCP 配置和版本。朋友实际运行前会校验 CLI、技能和配置。新版本校验或写入失败时保留旧版本；已经启动的朋友继续使用原版本快照。
+本机批准并启用后，老五先复用合适职责；职责不适合时可在模板上限内自主创建永久朋友，跨频道及本地复用，并自行更新、启停。默认关闭，内置及文件维护角色受保护。注册后仍须执行任务并审阅交接，不能把配置成功当作任务完成；见 [自主朋友说明](docs/autonomous-friends.md)。
+
+每位朋友都有独立人格、技能清单、能力配置和版本。朋友实际运行前会校验 CLI、技能和配置。新版本校验或写入失败时保留旧版本；已经启动的朋友继续使用原版本快照。
 
 主会话委派通过本地运行器启动独立的 `codex --no-daemon exec --ephemeral`，使用原有登录及配置的模型/provider。后台服务只在实际任务到期或有通知要表达时调用模型；空闲心跳不调用模型。默认最多两位朋友同时工作，同一目录或上下级目录的写入任务串行执行。
 
@@ -108,11 +110,13 @@ python3 /目标/老五/scripts/laowu.py doctor
 
 恢复后后台保持暂停，核实工作目录和外部操作后，用 `daemon resume` 恢复调度。旧会话在线状态不从备份恢复。
 
+遗忘期间使用独立的处理屏障，成功完成后自动接受新输入；用户手动暂停及备份恢复暂停仍保留。失败/崩溃时需先完成清理，`daemon resume` 不能绕过遗忘屏障。Slack 的 Socket `connected` 不代表正在处理消息，使用 `slack status/doctor` 的 `processing` 字段查看暂停原因与恢复提示，详见 [Slack 说明](docs/slack.md)。
+
 MCP 提供 `bootstrap`、`memory_*`、`friend_*`、`task_*`、`session_checkpoint`、`schedule_*`、`event_emit`、`notification_*`、`background_status`；启用相应功能后还提供 `context_read` 和主会话独立验收入口 `task_review`。朋友仅拥有授权范围内的记忆读取、续读、本任务检查点和限后台任务使用的事件入口。进一步的宿主限制见 [Codex 兼容说明](docs/compatibility.md)。
 
 ## Slack 入口
 
-老五可作为独立 Slack Agent，通过 Socket Mode 在私聊和指定频道中对话，复用 Codex、朋友和本地记忆。入口默认关闭，安装可选依赖并配置应用及凭据后启用。认证后的 Slack 主会话可用 `slack_channels`、`slack_history`、`slack_thread` 按需读取授权频道与线程；频道历史不等于完整线程或附件内容。安装及读取边界见 [Slack 使用说明](docs/slack.md)。
+老五可作为独立 Slack Agent，通过 Socket Mode 在私聊和指定频道中对话，复用 Codex、朋友和本地记忆。入口默认关闭，安装可选依赖并配置应用及凭据后启用。认证后的 Slack 主会话可用 `slack_channels`、`slack_history`、`slack_thread` 按需读取授权频道与线程，通过 `slack_file_read` 读取已分享的UTF-8文本、常见图片及PDF/DOCX/XLSX，通过 `slack_file_send` 发送小文本或本来源completed/blocked终态有效交接登记的产物，`slack_file_status` 查询持久投递状态。历史只展示附件元数据；文档正文按版本续读，无OCR、不计算公式，旧DOC/XLS不支持。文件能力需安装 `.[slack]`、有效 `files:read/files:write` scopes及真实宿主验收。安装、大小限制和权限边界见 [Slack 使用说明](docs/slack.md)。
 
 ## 可选能力
 

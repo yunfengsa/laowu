@@ -387,6 +387,9 @@ class ScheduleBook:
         at = at.astimezone(UTC)
         emitted = []
         with self.store.transaction() as db:
+            from .processing import status
+            if status(self.store, db)['paused']:
+                return emitted
             rows = db.execute("""SELECT * FROM schedules WHERE enabled=1 AND deleted_at IS NULL
                 AND next_run_at<=? ORDER BY next_run_at,id LIMIT ?""", (_stamp(at), BATCH_SIZE)).fetchall()
             for row in rows:

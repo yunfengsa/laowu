@@ -174,7 +174,7 @@ class Schema2LayoutTests(unittest.TestCase):
 
     def test_future_schema_extension_and_layout_are_rejected_before_writes(self):
         for table, key, value in (('memory_meta','schema_version','3'),
-                                  ('memory_meta',migrations.LAYOUT_KEY,'2'),
+                                  ('memory_meta',migrations.LAYOUT_KEY,str(migrations.LAYOUT_REVISION + 1)),
                                   ('runtime_meta','schema_version','2'),
                                   ('background_meta','schema_version','2'),
                                   ('slack_meta','schema_version','2')):
@@ -219,7 +219,7 @@ class Schema2LayoutTests(unittest.TestCase):
                     self.assertEqual(db.execute("SELECT checkpoint FROM tasks WHERE id='legacy'").fetchone()[0], '{"summary":"old"}')
                     self.assertEqual(db.execute("SELECT status FROM notifications WHERE id='unknown'").fetchone()[0], 'uncertain')
         with self.raw() as db:
-            db.execute('INSERT INTO memory_meta VALUES(?,?)', (migrations.LAYOUT_KEY,'2'))
+            db.execute('INSERT INTO memory_meta VALUES(?,?)', (migrations.LAYOUT_KEY,str(migrations.LAYOUT_REVISION + 1)))
         archive = self.archive(2)
         before = self.dump(destination.path)
         with self.assertRaises(ValueError):

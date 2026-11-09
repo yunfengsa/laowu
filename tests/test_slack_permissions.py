@@ -30,6 +30,7 @@ class SlackPermissionTests(unittest.TestCase):
         self.assertEqual(fs[":minimal"], "read")
         self.assertEqual(fs[str(self.root)], "read")
         self.assertEqual(fs[str(self.workspace)], "write")
+        self.assertEqual(fs[str(self.root / "config")], "read")
         for path in (self.root / ".laowu", Path.home() / ".ssh",
                      Path.home() / ".aws", Path.home() / ".config", Path("/proc")):
             self.assertEqual(fs[str(path)], "deny")
@@ -46,6 +47,30 @@ class SlackPermissionTests(unittest.TestCase):
         fs = values["permissions.laowu_slack.filesystem"]
         self.assertEqual(fs[str(self.root)], "write")
         self.assertEqual(fs[str(self.root / ".laowu")], "deny")
+        self.assertEqual(fs[str(self.root / "config")], "read")
+
+    def test_policy_directory_cannot_receive_a_nested_workspace_write_grant(self):
+        directory = self.root / "config"
+        nested = directory / "nested"
+        nested.mkdir(parents=True)
+        alias = self.root / "config-alias"
+        alias.symlink_to(directory, target_is_directory=True)
+        for workspace in (directory, nested, alias):
+            with self.subTest(workspace=workspace), self.assertRaises(PermissionError):
+                permissions.profile_overrides(self.root, workspace, True)
+        values = permissions.profile_overrides(self.root, nested, False)
+        self.assertEqual(values["permissions.laowu_slack.filesystem"][str(nested)], "read")
+
+    def test_other_project_config_remains_an_ordinary_writable_workspace(self):
+        other = self.root.parent / "other-project"
+        config = other / "config"
+        config.mkdir(parents=True)
+        for workspace in (other, config):
+            fs = permissions.profile_overrides(self.root, workspace, True)["permissions.laowu_slack.filesystem"]
+            self.assertEqual(fs[str(workspace)], "write")
+            self.assertEqual(fs[str(self.root / "config")], "read")
+            if workspace == other:
+                self.assertNotIn(str(config), fs)
 
     def test_readonly_profile_does_not_grant_workspace_write(self):
         values = permissions.profile_overrides(self.root, self.workspace, False)
@@ -115,10 +140,14 @@ class SlackPermissionTests(unittest.TestCase):
                 patch.object(permissions.subprocess, "run") as run:
             run.return_value = subprocess.CompletedProcess([], 0, "laowu-sandbox-probe:ok\n", "")
             self.assertTrue(permissions.probe(self.root, self.workspace))
+            self.assertTrue(permissions.probe(self.root, self.root))
             command = run.call_args.args[0]
             self.assertEqual(command[:4], ["/fake/codex", "--no-daemon", "sandbox", "-P"])
             self.assertIn("-I", command)
             self.assertNotIn("exec", command)
+            fs_override = next(value for value in command if value.startswith("permissions.laowu_slack.filesystem="))
+            self.assertIn('"' + str(self.root / "config") + '" = "read"', fs_override)
+            self.assertIn('"' + str(self.root) + '" = "write"', fs_override)
             self.assertEqual(run.call_args.kwargs["env"]["OPENAI_API_KEY"], "probe-only-not-a-secret")
             permissions._CACHE.clear()
             run.return_value = subprocess.CompletedProcess([], 1, "laowu-sandbox-probe:failed\n", "")

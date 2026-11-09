@@ -197,9 +197,13 @@ def run(store, run_id: str, lease_fd: int) -> int:
     signal.signal(signal.SIGINT, interrupt)
     try:
         with store.transaction() as db:
+            from .processing import require
+            require(store, db, background=False)
             row = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
             if not row or row["status"] not in {"starting", "running"}:
                 return 1
+            if row['friend_id'] == 'laowu':
+                raise PermissionError('laowu 不能作为 worker 身份')
             run_info = dict(row)
             db.execute("UPDATE runs SET supervisor_pid=?,supervisor_identity=?,updated_at=? WHERE id=?",
                        (os.getpid(), process_identity(os.getpid()), now(), run_id))
@@ -236,11 +240,16 @@ def run(store, run_id: str, lease_fd: int) -> int:
             db.execute("UPDATE runs SET status=CASE WHEN status='starting' THEN 'running' ELSE status END,child_pid=?,child_identity=?,updated_at=? WHERE id=?",
                        (process.pid, process._laowu_identity, now(), run_id))
             db.execute('INSERT OR IGNORE INTO run_cleanup VALUES(?)', (run_id,))
-        live_anchor = anchor_status(process) is None
-        if permitted and process._laowu_identity and live_anchor:
-            os.write(gate_write, b'1')
-        else:
-            interrupted = True
+        # The anchor is inert until this byte. Recheck under the same lock as
+        # forget's durable intent so a revoked launch cannot start the model.
+        with store._lock(), store.connect() as db:
+            from .processing import status
+            permitted = permitted and db.execute("SELECT 1 FROM runs WHERE id=? AND status='running'", (run_id,)).fetchone()
+            live_anchor = anchor_status(process) is None
+            if permitted and not status(store, db)['maintenance'] and process._laowu_identity and live_anchor:
+                os.write(gate_write, b'1')
+            else:
+                interrupted = True
         os.set_blocking(lease_fd, False)
         selector.register(lease_fd, selectors.EVENT_READ, "lease")
         os.set_blocking(process.stdout.fileno(), False)

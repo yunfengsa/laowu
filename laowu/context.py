@@ -58,20 +58,15 @@ class Context:
                 row = db.execute('SELECT * FROM memory_records WHERE id=?', (ident,)).fetchone()
                 if not row:
                     raise ValueError('引用已失效，请重新检索')
-                actor, task = 'laowu', None
                 scopes = None
                 if s.worker_run:
-                    run = s._worker()
-                    actor, task = run['friend_id'], run['task_id']
-                    from .access import task_access, allowed_scopes
-                    grant = task_access(self.store, task, db=db)
-                    if grant:
-                        scopes = allowed_scopes(db, grant['conversation_id'], grant['audience'], actor, task)
+                    from .access import worker_scopes
+                    scopes = worker_scopes(self.store, db, s._worker())
                 elif s.access:
                     scopes = s.access.scopes(db)
-                if not self.store._visible(row['scope'], actor, task) or (scopes is not None and row['scope'] not in scopes):
+                if scopes is not None and row['scope'] not in scopes:
                     raise PermissionError('引用记忆不可见')
-                return self.store._record(db, row)
+                return self.store._record(db, row, scopes)
             if kind in ('task','result','checkpoint','review'):
                 if s.worker_run:
                     if s._worker()['task_id'] != ident or kind != 'checkpoint':
@@ -100,6 +95,8 @@ class Context:
                 if not s.access or ident != s.access.conversation_id:
                     raise PermissionError('频道引用不可见')
                 return {'summary': s.access.validate(db)['summary']}
+            elif kind == 'friend_definition':
+                return s.registry.describe(ident)
             elif kind == 'friend':
                 friends = s._slack_friends() if s.access else s.registry.list()
                 for friend in friends:
@@ -138,6 +135,8 @@ class Context:
             return obj('checkpoint', args.get('task_id') or self.service._worker()['task_id'])
         if tool == 'task_review':
             return obj('review', args['task_id'])
+        if tool in ('friend_create', 'friend_get', 'friend_update', 'friend_set_active'):
+            return obj('friend_definition', value['id'])
         if tool == 'memory_upsert':
             return obj('memory', value['id'])
         def tree(node, key=None):
@@ -149,7 +148,7 @@ class Context:
                         return obj('memory', node['id'])
                     if key == 'recent_summaries':
                         return obj('session', node['id'])
-                    if key == 'friends' or tool in ('friend_list','friend_ensure'):
+                    if key == 'friends' or (tool in ('friend_list','friend_ensure') and key != 'templates'):
                         return obj('friend', node['id'])
                     if key == 'tasks':
                         # Bootstrap is a metadata projection, not a request grant.
@@ -196,6 +195,17 @@ class Context:
             return self._present(tool, args, value)
 
     def _present(self, tool, args, value):
+        from .slack_files import TOOLS as FILE_TOOLS, file_content
+        if tool in FILE_TOOLS:
+            if not self.service.access or self.service.worker_run:
+                raise PermissionError('文件响应仅供认证Slack主会话')
+            self.service.access.validate()
+            response = file_content(self.store, value)
+            from .metrics import sample
+            from .telemetry import best_effort
+            best_effort(sample, self.store, self.service.manager.id, 'mcp',
+                        mcp_bytes=len(dumps(response).encode()), previews=0, pages=1)
+            return value
         if tool in {'slack_channels', 'slack_history', 'slack_thread'}:
             # External Slack pages have their own revocable, versioned cursors.
             # Never turn them into local context references or persist bodies.

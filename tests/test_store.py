@@ -37,7 +37,8 @@ class StoreTests(unittest.TestCase):
                          {"shared", "tasks", "friend:engineer"})
         self.assertEqual({m["scope"] for m in self.store.memory_search(actor="confidant")},
                          {"personal", "shared", "tasks"})
-        self.assertEqual(len(self.store.memory_search(actor="laowu")), 5)
+        self.assertEqual(len(self.store.memory_search()), 5)
+        self.assertNotIn("personal", {m["scope"] for m in self.store.memory_search(actor="laowu")})
         self.assertEqual(self.store.memory_search(scope="personal", actor="engineer"), [])
         with self.assertRaises(PermissionError):
             self.store.memory_upsert("私人", actor="engineer")
@@ -95,6 +96,25 @@ class StoreTests(unittest.TestCase):
         self.assertEqual((other.root / "friends/engineer/AGENTS.md").read_text(), "工程师")
         with other.connect() as conn:
             self.assertEqual(conn.execute("SELECT status FROM custom_runtime").fetchone()[0], "done")
+
+    def test_restore_without_friend_policy_removes_current_policy_and_defaults_closed(self):
+        from laowu.friend_policy import policy
+        path = self.root / 'config/friend-policy.json'
+        old = Path(self.tmp.name) / 'without-policy.zip'
+        shutil.copyfile(self.store.backup()['path'], old)
+        with zipfile.ZipFile(old) as archive:
+            self.assertNotIn('assets/config/friend-policy.json', archive.namelist())
+        path.parent.mkdir(exist_ok=True)
+        path.write_text('{"enabled":true,"templates":{}}')
+        enabled = Path(self.tmp.name) / 'with-policy.zip'
+        shutil.copyfile(self.store.backup()['path'], enabled)
+        self.assertTrue(policy(self.root)['enabled'])
+        for _ in range(2):
+            self.store.restore(old)
+            self.assertFalse(path.exists())
+            self.assertEqual(policy(self.root), {'enabled': False, 'templates': {}})
+            self.store.restore(enabled)
+            self.assertTrue(policy(self.root)['enabled'])
 
     def test_moved_snapshot_can_regenerate_codex_absolute_paths(self):
         from laowu.adapters import render_project_configs

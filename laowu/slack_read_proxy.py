@@ -10,8 +10,9 @@ import threading
 from .access import SlackAccess
 from .context import dumps
 from .slack_context import ContextReadError, MAX_RESPONSE, REQUEST_SECONDS
+from .slack_files import MAX_IMAGE_RESPONSE, FILE_SECONDS, TOOLS as FILE_TOOLS
 
-MAX_REQUEST = 12 * 1024
+MAX_REQUEST = 64 * 1024
 
 
 def socket_path(store):
@@ -74,7 +75,8 @@ class _Handler(socketserver.StreamRequestHandler):
             result = self.server.reader.read(request['principal'], request['method'], request['arguments'])
             SlackAccess.from_token(self.server.reader.store, request['principal']).validate()
             reply = dumps({'data': result}).encode() + b'\n'
-            if len(reply) > MAX_RESPONSE:
+            budget = MAX_IMAGE_RESPONSE if request['method'] == 'slack_file_read' else MAX_RESPONSE
+            if len(reply) > budget:
                 raise ValueError('read_frame: 响应预算超限')
         except Exception as exc:
             message = str(exc) if isinstance(exc, (PermissionError, ValueError, ContextReadError)) else 'read_failed: 网关读取失败，请检查状态'
@@ -153,13 +155,13 @@ def request_context(access, method, arguments):
         if len(message) > MAX_REQUEST:
             raise ValueError('read_frame: 请求过大')
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(REQUEST_SECONDS + 5)
+            connection.settimeout((FILE_SECONDS if method in FILE_TOOLS else REQUEST_SECONDS) + 5)
             connection.connect(str(path))
             connection.sendall(message)
             with connection.makefile('rb') as stream:
-                result = _receive(stream, MAX_RESPONSE)
+                result = _receive(stream, MAX_IMAGE_RESPONSE if method == 'slack_file_read' else MAX_RESPONSE)
     except OSError:
-        raise ContextReadError('read_proxy_unavailable: 网关只读代理未运行、超时或不可达；请由本机维护会话检查/重载网关。尚未读取历史。') from None
+        raise ContextReadError('read_proxy_unavailable: 网关代理未运行、超时或不可达；请由本机维护检查。文件发送可能已执行，须以原幂等键查询slack_file_status，不能盲目重发。') from None
     access.validate()
     if 'error' in result:
         raise ContextReadError(result['error'])

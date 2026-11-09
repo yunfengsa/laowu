@@ -3,8 +3,11 @@
 .codex/
 .claude/settings.local.json
 /config/features.json
+/config/friend-policy.json
 
 # Local verification records and implementation drafts; retain them on disk.
+/artifacts/
+/.review-task_*/
 /docs/acceptance.md
 /docs/*-acceptance.md
 /docs/client-error-investigation.md

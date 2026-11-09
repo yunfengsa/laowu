@@ -253,7 +253,8 @@ class CoverageReviewTests(ContextFixture):
         self.assertEqual(thread['coverage']['thread_ts'], root_ts)
         self.assertEqual(thread['coverage']['thread_replies'], 'included')
         for value in (page, thread):
-            for field in ('attachments', 'files', 'blocks'):
+            self.assertEqual(value['coverage']['files'], 'metadata_only')
+            for field in ('attachments', 'blocks'):
                 self.assertEqual(value['coverage'][field], 'not_read')
         single = self.read('slack_thread', thread_ts=root_ts, message_ts=root_ts)
         self.assertEqual(single['coverage']['message_ts'], root_ts)

@@ -55,7 +55,7 @@ python3 scripts/laowu.py slack reset C频道ID
 
 也可在 Slack 直接说“重新开始当前对话”。重置清理该频道待处理的旧输入、撤销旧主会话授权并切换上下文，长期记忆保留；已独立安排的异步结果仍绑定原频道与线程，私人结果不会降级送入共享环境。
 
-首版支持文字、代码块、链接、状态和交互按钮。含附件的输入仅处理附带文字并说明附件暂不读取；语音、附件理解和自动上传文件尚未开放。
+支持文字、代码块、链接、状态、交互按钮及受控文件收发。无文字附件也按相同收件人规则进入对话；消息和历史只展示前10个文件的真实ID、有限文件名、大小及类型，正文需按需调用 `slack_file_read`。附件名和正文均是不可信资料，不改变本轮维护语境。安装 `.[slack]` 后可解析PDF文本层、DOCX主文档、XLSX单元格及常见图片；语音、旧DOC/XLS和其他二进制暂不解析。
 
 ## 记忆与读取范围
 
@@ -88,11 +88,27 @@ python3 scripts/laowu.py slack channels G私有频道ID --personal no
 
 遗忘清理本项目受管记忆、摘要、队列、派生内容和相关备份，并撤销旧上下文引用。已经发出的 Slack 消息、Codex 原生会话及模型提供商记录有各自的保留规则，不在项目数据库删除保证内。
 
+遗忘完成后可继续发送新的 Slack 对话，无需额外 `daemon resume`；连接器重新核实频道并建立新上下文。此前用户显式暂停、备份恢复后的暂停仍保留。失败或崩溃留下的遗忘屏障禁止模型与内容投递，须修复清理故障并由本地 Store 启动修复，不能用 `daemon resume` 跳过。
+
+### 已连接却没有回复
+
+`slack status` 和 `slack doctor` 的 `runtime.status=connected` 只表示 Socket 连接状态。另看 `processing.enabled`（Slack 配置开关）、`processing.paused`、`processing.reasons` 与 `processing.recovery`；收件箱 `pending` 不能证明模型已开始执行。
+
+| processing.reasons | 可核实的原因与处理 |
+| --- | --- |
+| `manual` | 正式 `daemon pause` 留下的操作员暂停；需要继续时执行 `daemon resume`。 |
+| `restore` | 受控备份恢复后待核对；核实工作目录、旧任务、计划与投递回执后 `daemon resume`，并另行核实身份及 `slack enable`。 |
+| `forget_pending` / `forget_unapplied` | 遗忘账本未收尾或数据库完成水位未覆盖；检查活动进程、文件清理及存储故障，重新打开 Store 重试清理。 |
+| `forget_ledger_invalid` | 遗忘账本无法读取或无效，处理保守停止；先修复账本/存储，不能删账本强行继续。 |
+| `legacy_unknown` | 旧版 `paused=1` 没有来源，不能推断为用户暂停或遗忘残留。核实账本完成、旧任务/通知/计划已清理后，显式 `daemon resume`。 |
+
+这些本地诊断不调用 Slack API 或模型。来源明确的临时遗忘屏障自动解除只放行新工作，不复活已清除的旧内容。
+
 参考：[Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/)、[Agent 消息体验](https://docs.slack.dev/ai/migrating-to-agent-messaging/)、[Agent Sessions](https://docs.slack.dev/ai/agent-sessions/)、[Codex App Server](https://learn.chatgpt.com/docs/app-server)、[Codex 权限](https://learn.chatgpt.com/docs/permissions)。
 
 ## 按需读取频道与线程上下文
 
-Slack 主会话现在有三个受控只读工具。每轮 `slack_source` application context 提供可信的 `channel_id`、`reply_thread_ts` 和当前消息 `message_ts`，无需从用户文字猜测来源。模型遇到“前面”“之前”“这个线程”等而上下文不足时，应主动使用工具，不自动在每轮请求前抓取大量历史。
+Slack 主会话有三个历史读取工具及下文的三个文件工具。每轮 `slack_source` application context 提供可信的 `channel_id`、`reply_thread_ts` 和当前消息 `message_ts`，无需从用户文字猜测来源。模型遇到“前面”“之前”“这个线程”等而上下文不足时，应主动使用工具，不自动在每轮请求前抓取大量历史。
 
 | 工具 | 参数与用途 |
 | --- | --- |
@@ -100,7 +116,7 @@ Slack 主会话现在有三个受控只读工具。每轮 `slack_source` applica
 | `slack_history` | `channel_id?`、`cursor?`、`oldest?`、`latest?`、`limit?`：当前频道或指定频道的顶层消息，不包含完整线程回复；`limit` 默认 10，范围 1–10，时间戳为字符串、边界不包含。顺序从新到旧。 |
 | `slack_thread` | `thread_ts`、`channel_id?`、`cursor?`、`limit?`：指定线程的根消息及回复，默认当前频道，顺序从旧到新。`thread_ts` 可取可信 `reply_thread_ts` 或已读取根消息的 `ts`；不能自行编造。 |
 
-续读将 `next_cursor` 原样传回同一工具；`slack_thread` 同时保留原 `thread_ts`。其余查询参数可省略，若提供必须与初始查询一致。只有 `has_more=false` 才表示该查询范围的消息正文读取完毕：`slack_history` 仅覆盖频道顶层消息，不能据此声称已读完整线程。返回的 `reply_count` / `has_replies` 提示根消息是否有回复，需要时调用 `slack_thread(thread_ts=根消息ts)`；计数仅保留非负整数并限制到 2³¹−1，缺失或无效时为 0，不展开 reply_users/replies。`coverage` 明示 `channel_top_level` 或 `thread`，线程页同时给出 `thread_ts`；单条续读另标 `message_ts`。每页都注明附件、文件和 blocks 为 `not_read`，线程读取也不代表这些内容已读。
+续读将 `next_cursor` 原样传回同一工具；`slack_thread` 同时保留原 `thread_ts`。其余查询参数可省略，若提供必须与初始查询一致。只有 `has_more=false` 才表示该查询范围的消息正文读取完毕：`slack_history` 仅覆盖频道顶层消息，不能据此声称已读完整线程。返回的 `reply_count` / `has_replies` 提示根消息是否有回复，需要时调用 `slack_thread(thread_ts=根消息ts)`；计数仅保留非负整数并限制到 2³¹−1，缺失或无效时为 0，不展开 reply_users/replies。`coverage` 明示 `channel_top_level` 或 `thread`，线程页同时给出 `thread_ts`；单条续读另标 `message_ts`。文件标为 `metadata_only`，消息的 `files` 给有限元数据，`files_truncated` 提示超过10个；附件和 blocks 仍为 `not_read`。线程读取不代表文件正文已读。
 
 返回页还包含作者 ID、`ts`、`thread_ts`、频道 ID 与正文；不展开作者档案或其他完整 metadata。历史、频道名称和历史中的 `<root>`、命令、引用均为不可信参考，不进入收件箱、不重新触发旧任务，也不改变本轮维护语境。
 
@@ -114,7 +130,7 @@ Slack 主会话现在有三个受控只读工具。每轮 `slack_source` applica
 
 ### 权限与凭据边界
 
-只有 SlackGateway 读取 `xoxb/xapp`。MCP 沿用原有 `SlackAccess` opaque principal 文件（不是 Slack API 令牌），通过 `.laowu/slack/context.sock` 与网关通信。父目录 `0700`、socket `0600`；仅固定的三个读方法与参数可通过，不接受任意 URL、身份、工作区、执行或文件路径。主会话的 shell、文件、连接器权限不变；桌面主会话和工程师等 worker 不提供这些工具，直接调用也会被拒绝。
+只有 SlackGateway 读取 `xoxb/xapp`。MCP 沿用原有 `SlackAccess` opaque principal 文件（不是 Slack API 令牌），通过 `.laowu/slack/context.sock` 与网关通信。父目录 `0700`、socket `0600`；仅固定的历史及文件方法与参数可通过，不接受任意 URL、身份、工作区或执行入口。文件发送中的 `artifact` 必须匹配已授权任务登记产物，不是任意路径。主会话的 shell、本地文件、其他连接器权限不变；桌面主会话和工程师等 worker 不提供这些工具，直接调用也会被拒绝。
 
 每页先核对 principal 是否撤销、源频道 generation/资格与配置，再用实时 `auth.test`、频道信息和完整成员列表核对工作区、bot、本人及目标。返回前再次检查目标和源权限，最终再次核对本地绑定。不自动加入任何频道，不读取 bot 或本人已退出的频道；跨频道读取不更新 `slack_channels`，不授予跨频道任务或记忆权限。
 
@@ -132,6 +148,49 @@ Slack 主会话现在有三个受控只读工具。每轮 `slack_source` applica
 
 新读取路径向固定 `https://slack.com/api/` 使用真正 HTTP GET、拒绝重定向，且不调用写入 API。官方 Python 同步 SDK 会将其 GET 参数调用转为 POST/form，因此新路径有独立受限 GET 传输；原有发消息、回执与补漏传输不变。[官方 conversations.replies 文档](https://docs.slack.dev/reference/methods/conversations.replies/) 列出了 bot 的 `channels:history` / `groups:history` / `im:history` scopes；不预先要求更换 user token。[频道发现 API](https://docs.slack.dev/reference/methods/conversations.list/) 使用对应 read scopes。安装后需在授权的测试频道验证 history、next_page、thread、channels；可用范围取决于应用权限和频道成员资格。
 
-代理只允许两项并行读取，请求帧最多 12 KiB、单次读取预算 25 秒、MCP socket 超时 30 秒，单个 API 响应最多 2 MiB。超大 API 页会明确失败，可减少 `limit` 重试；不会静默切掉正文。权限、格式、未知错误不自动重试；临时网络、服务端和限流错误复用 `ReadRetry` 的持久白名单预算（新增 `slack.context`），遵守 `Retry-After`，在等待期内同参数调用不会再发 API。错误会给出脱敏代码、`read_key`、`retry_at` 与下一步；不得把失败说成已经看过。挂起的读取需由本机维护会话用 `reads list` / `reads retry <read_key>` 核实恢复，不重新发送任何 Slack 消息。指标失败不阻断结果。
+代理只允许两项并行操作，请求帧最多 64 KiB（容纳转义后的生成文本）；历史单次读取预算 25 秒、MCP socket 超时 30 秒，单个 API JSON 响应最多 2 MiB。超大 API 页会明确失败，可减少 `limit` 重试；不会静默切掉正文。历史权限、格式、未知错误不自动重试；临时网络、服务端和限流错误复用 `ReadRetry` 的持久白名单预算（`slack.context`），遵守 `Retry-After`，在等待期内同参数调用不会再发 API。错误会给出脱敏代码、`read_key`、`retry_at` 与下一步；不得把失败说成已经看过。挂起的历史读取需由本机维护会话用 `reads list` / `reads retry <read_key>` 核实恢复。文件工具不使用自动重试；指标失败不阻断结果。
 
 离线测试覆盖读取权限、分页、预算和版本变化；真实 Codex 按需调用、Slack API 权限及 Unix socket 通信需在目标宿主验证。步骤与验收边界见 [验证说明](verification.md)。
+
+## 受控文件收发
+
+Manifest 增加 `files:read`、`files:write` 后须重新安装/批准应用，使现有 bot token 获得有效 scopes。`slack doctor/status` 列出所需 scopes、大小限制和投递状态计数；`effective_token_scopes=not_checked` 明确表示本地诊断没有验证真实令牌。令牌仍只在网关进程使用。
+
+| 工具 | 用法与边界 |
+| --- | --- |
+| `slack_file_read` | `file_id`，可选 `channel_id`（默认当前频道）、`text_offset`、`text_version`。调用 `files.info`，验证文件确实分享至指定可读频道，再下载；仅知道ID不够。下载后重新核对分享与双方成员资格。 |
+| `slack_file_send` | 必填稳定的 `idempotency_key`；二选一：`filename` + `text`，或 `task_id` + `artifact`。只能在当前有效输入期间发回当前频道、本轮原线程，不接受接收频道/线程参数。 |
+| `slack_file_status` | `idempotency_key`。重启后以同来源新 principal 查询持久状态；只读取 Slack 结果，绝不自动重新上传。 |
+
+读取支持Slack原生 `hosted` 和 `snippet` 文件；仍拒绝外部/远程文件。有效UTF-8文本输入最多1 MiB，PDF/DOCX/XLSX及PNG/JPEG/GIF/WebP输入最多20 MiB。依赖固定在可选组 `.[slack]`，缺依赖会明确返回 `parser_dependencies_missing`，工具注册不代表宿主已经可解析。
+
+文本和文档提取正文统一保留 `text_offset/text_length/text_version/next_offset/text_complete`，offset按Unicode字符计数。必须以原 `text_version` 和 `next_offset` 续读到结束，不能把一页响应当完整文档。每次重新下载、鉴权和解析，不创建全文缓存；版本还绑定提取结果，文件或解析结果改变会拒绝旧offset。正文响应最多16 KiB且服从集中预算；超过提取资源限制时明确拒绝整份解析，不静默截断正文。
+
+| 格式 | 提取内容及限制 |
+| --- | --- |
+| PDF | 最多200页、单页解压内容16 MiB，提取带页码的文本层。`pages_without_text`列出无文本页（可能是扫描件或空白页），未做OCR；不读取批注或附件，不执行脚本/链接。加密PDF拒绝。 |
+| DOCX | 按主文档顺序提取段落、表格、链接显示文字；不含页眉页脚、脚注、批注、修订语义、公式图形和嵌入对象，不做OCR。 |
+| XLSX | 全部工作表（含隐藏表）的非空单元格、坐标及公式原文；最多100表、每表10000行/256列、全文件100000单元格。忽略可能虚报的数据范围，超过限额明确拒绝。公式不计算，不采用可能缺失或过期的缓存；不加载外链、宏、图表、批注或图片。 |
+| PNG/JPEG/GIF/WebP | 最多4000万像素，Pillow验证并实际解码，按EXIF方向重新编码为PNG；最长边2560，必要时继续缩小使图片bytes不超过4 MiB。返回真实MCP `image`，并报告原始/输出尺寸、字节数和是否缩放；移除元数据和尾随载荷，动图只展示首帧。 |
+
+文档提取文字总量最多4 MiB；DOCX/XLSX压缩包最多1024条目、单条解压16 MiB、总解压64 MiB、压缩比200；拒绝重复条目、路径穿越、符号链接、加密、宏/嵌入可执行内容及DTD/实体。解析子进程仅通过管道接收bytes，不带网关凭据环境，CPU最多8秒、墙钟最多15秒、地址空间768 MiB，超时会终止回收；不能设置资源限制的宿主拒绝解析。图片响应另有6 MiB总预算，不经过 `context_read` 或存入数据库。旧DOC/XLS、宏文档、语音、不支持格式、损坏及超限返回 `not_read/not_parsed` 和原因，不表示已理解，也不写入长期记忆。原文件不会因读取而另存本地。
+
+下载只访问 `https://files.slack.com/files-pri/…`，签名上传只访问 `https://files.slack.com/upload/…`；拒绝其他主机、端口、URL凭据、重定向及压缩响应，不继承系统代理。流式限制实际字节数，不能用伪造Content-Length绕过。令牌只附到受限下载，上传URL不带bearer token。每次文件操作总预算55秒、socket超时60秒；超时后必须查状态。
+
+生成文本仅支持 `.txt/.md/.csv`，UTF-8最多8 KiB，拒绝可识别令牌/私钥。产物发送要求 `task_id` 属于当前来源与generation、任务为 `completed` 或 `blocked` 终态并有完整有效JSON最终交接、`artifact` 是其中 `artifacts` 数组的精确绝对路径，并位于本项目 `artifacts/` 内。任务不能有活动或待清理运行实例；检查点路径本身不授予发送权限。允许blocked终态产物，便于交付已生成但因缺发送能力受阻的文件，不更改任务或验收状态。每个发送阶段重新检查任务授权；任务恢复运行时停止发送并保留不确定状态。
+
+支持图片/PDF/DOCX/XLSX最多20 MiB、UTF-8 `.txt/.md/.csv` 最多1 MiB。DOCX/XLSX先使用同样的受限解析及包检查，并检查解压XML和正文中的可识别凭据，防止ZIP压缩隐藏凭据；发送保留原文件bytes。拒绝另一个任务也登记的产物、代码/配置/数据库、隐藏路径、路径穿越、任意层symlink、hardlink、非普通文件及读取期间变化。没有任意本地文件读取入口；需先取得最终任务交接才能发送产物。
+
+例：`slack_file_send({"idempotency_key":"report-v1","filename":"结果.txt","text":"这里是生成的结果"})`；任务图片使用 `slack_file_send({"idempotency_key":"painting-v1","task_id":"任务ID","artifact":"已登记的项目artifacts内绝对路径"})`。这些调用是外部写入，只在用户已授权发送时使用。模型看到产物路径本身不等于获准发送。
+
+上传遵循官方 [`files.getUploadURLExternal`](https://docs.slack.dev/reference/methods/files.getUploadURLExternal/)（POST form，不能JSON）→ 上传bytes → [`files.completeUploadExternal`](https://docs.slack.dev/reference/methods/files.completeUploadExternal/)（JSON）流程，不使用已废弃的 `files.upload`。成功记录 `sent` 和 `file_id`，用 [`files.info`](https://docs.slack.dev/reference/methods/files.info/) 获取 `permalink`；若链接查询暂时失败，已确认的 `sent` 保留，下次status可补链接。
+
+无schema升级：投递状态使用现有 `slack_meta` 的 `file-send:<哈希>` 键，仅保存来源、路由、请求/内容摘要、上传阶段、文件ID、回执和脱敏错误，不保存文件bytes、文件名/路径、上传/下载URL或原始幂等键。每个网络写步骤前持久化状态。`allocating/allocated/uploading/uploaded/completing` 重启后变成 `uncertain`；`failed/uncertain` 都不自动重传。重复键返回原状态，换内容同键拒绝；同来源/线程/任务/内容的换键重发也拒绝（改名不绕过内容去重）。不确定时只有查到正确频道和线程的分享才能确认 `sent`，查不到并不证明未发送。更改内容不应被用来绕过核对。
+
+遗忘清空可识别投递元数据，只保留匿名幂等键墓碑。恢复备份合并较新投递决策及墓碑，避免回滚导致重发；恢复到Slack接入前的备份时，在现有 `memory_meta` 暂存匿名墓碑。频道reset/恢复产生的新generation不能继续操作旧来源投递。旧备份不含文件bytes，未完成的Slack临时上传不会由本项目继续完成或自动删除；未调用complete的文件由Slack丢弃。正式恢复/备份及人工核对需由本机维护会话进行。
+
+上线验证须由宿主维护会话独立完成：安装 `.[slack]`；核对有效token scopes；无文字附件进入正确来源；真实snippet/PDF/DOCX/XLSX/大图经代理和MCP读取及模型实际看图；跨私聊文件拒绝；已授权blocked画作/办公产物完整上传及原线程回执；重启后status和不确定发送核对。合成测试及宿主复验命令见 [文件验收说明](slack-file-verification.md)。离线测试不能代替真实Slack/模型，也不能把工具注册或manifest更新当作可用性证明。
+
+## 普通会话的朋友管理
+
+本机批准模板并启用后，普通 Slack 主会话先复用已有职责，确有缺口时可直接 friend_create，随后 task_start 并审阅，无需逐次确认或 root。新朋友跨频道及本地复用，主会话按 expected_version 更新或启停；内置及文件维护角色受保护。配置注册不等于真实任务已完成。网络、额度、权限或依赖故障须处理原因，不能靠反复创建朋友解决。范围、默认关闭策略、personal 交集及遗忘恢复见 [自主朋友说明](autonomous-friends.md)。

@@ -190,9 +190,8 @@ def execute(args, root):
             if args.action == 'status':
                 return daemon_status(store)
             if args.action in ('pause', 'resume'):
-                with store.transaction() as db:
-                    db.execute("INSERT OR REPLACE INTO background_meta VALUES('paused',?)", ('1' if args.action == 'pause' else '0',))
-                return {'paused': args.action == 'pause'}
+                from .processing import set_operator_pause
+                return set_operator_pause(store, args.action == 'pause')
             return service_action(store, args.action)
         if args.command == 'schedules':
             from .scheduling import ScheduleBook

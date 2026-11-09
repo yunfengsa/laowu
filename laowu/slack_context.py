@@ -15,7 +15,9 @@ from .policy import settings
 from .retries import ReadRetry, RetryPending, RetrySuspended, _READ_DEADLINE, remaining
 from .slack_client import SlackAPIError
 
-TOOLS = frozenset({'slack_channels', 'slack_history', 'slack_thread'})
+from .slack_files import TOOLS as FILE_TOOLS, metadata as file_metadata
+
+TOOLS = frozenset({'slack_channels', 'slack_history', 'slack_thread'}) | FILE_TOOLS
 MAX_RESPONSE = 16 * 1024
 TTL = 900
 REQUEST_SECONDS = 25
@@ -164,6 +166,9 @@ class SlackContextReader:
             raise PermissionError('read_method: 只允许 Slack 上下文读取工具')
         validate_arguments(method, arguments)
         access = SlackAccess.from_token(self.store, token)
+        if method in FILE_TOOLS:
+            from .slack_files import SlackFiles
+            return SlackFiles(self).call(access, method, arguments)
         state = self._query(method, arguments, access)
         # Opaque key contains no Slack text/IDs/token; an identical page shares
         # its persistent failure budget. Reads are retried only on another call.
@@ -279,7 +284,7 @@ class SlackContextReader:
                 raise ContextReadError('page_changed: 消息已编辑、删除或页已变化；请重新读取，不拼接旧片段')
             coverage = {'scope': 'thread' if method == 'slack_thread' else 'channel_top_level',
                         'thread_replies': 'included' if method == 'slack_thread' else 'not_read',
-                        'attachments': 'not_read', 'files': 'not_read', 'blocks': 'not_read'}
+                        'attachments': 'not_read', 'files': 'metadata_only', 'blocks': 'not_read'}
             if method == 'slack_thread':
                 coverage['thread_ts'] = query['thread_ts']
             else:
@@ -337,6 +342,8 @@ class SlackContextReader:
                 'ts': ts, 'thread_ts': str(message.get('thread_ts') or ts)[:32],
                 'text': redacted, 'original_text_length': len(text), 'redacted': redacted != text,
                 'reply_count': count, 'has_replies': count > 0,
+                'files': file_metadata(message.get('files', [])),
+                'files_truncated': len(message.get('files') or []) > 10,
                 'has_attachments': bool(message.get('files') or message.get('attachments'))}
         return {**result, 'text_version': digest(result)}
 

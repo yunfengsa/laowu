@@ -280,7 +280,10 @@ class SlackReadRecoveryTests(SlackReviewFixture):
     def test_input_lost_submission_no_turn_id_recovery_uses_durable_uncertainty(self):
         g=self.gateway()
         self.state.update_input(self.source['id'],status='processing')
-        with patch.object(self.session_type,'start_turn',side_effect=ConnectionError()) as start:
+        def lost_submission(session, *args, **kwargs):
+            with session.turn_admission():
+                raise ConnectionError()
+        with patch.object(self.session_type,'start_turn',autospec=True,side_effect=lost_submission) as start:
             g._execute(dict(self.source))
         self.assertEqual(start.call_count,1)
         record=self.state.inbox()[0]

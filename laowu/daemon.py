@@ -22,6 +22,9 @@ from .runtime import Manager, initialize_runtime, reconcile
 
 def recover_interrupted(store):
     with store.transaction() as db:
+        from .processing import status
+        if status(store, db)['paused']:
+            return
         rows = db.execute("""SELECT t.id,t.error,s.status AS owner_status,s.owner_pid,s.owner_identity
             FROM tasks t JOIN async_tasks a ON t.id=a.task_id LEFT JOIN sessions s ON t.session_id=s.id
             WHERE t.status='interrupted' AND t.error IN ('owner_lost','session_closed','interrupted')""").fetchall()
@@ -126,6 +129,9 @@ class Dispatcher:
         # Keep the project write lock through this short network operation so
         # forgetting cannot finish while an old in-memory payload is dispatched.
         with self.store._lock(), contextlib.closing(self.store.connect()) as db:
+            from .processing import status
+            if status(self.store, db)['paused']:
+                return
             row = db.execute("SELECT status FROM notifications WHERE id=?", (event['id'],)).fetchone()
             if not row or row['status'] != 'pending':
                 return
@@ -204,9 +210,8 @@ class Daemon:
 
     def tick(self):
         try:
-            with self.store.connect() as db:
-                paused = db.execute("SELECT value FROM background_meta WHERE key='paused'").fetchone()
-            if paused and paused[0] == '1':
+            from .processing import status
+            if status(self.store)['paused']:
                 self._heartbeat(error='paused')
                 return
             recover_interrupted(self.store)
@@ -219,15 +224,15 @@ class Daemon:
                                                origin_thread=None, context=occurrence['context'])
                     self.book.attach_task(occurrence['id'], task['id'])
                 except (ValueError, PermissionError, RuntimeError) as exc:
-                    with self.store.connect() as db:
+                    with self.store._lock(), self.store.connect() as db:
                         exists = db.execute('SELECT 1 FROM schedule_occurrences WHERE id=?', (occurrence['id'],)).fetchone()
-                    if not exists:
-                        continue  # Forgotten while this tick was preparing dispatch.
-                    scheduling_error = 'schedule:' + type(exc).__name__
-                    self.dispatcher.outbox.publish(
-                        f"定时计划 {occurrence['schedule_id']} 暂未启动。请检查朋友状态和工作目录；该期仍保留待执行。",
-                        event_key='schedule-error:' + occurrence['id'], topic='schedule.blocked',
-                        context=occurrence['context'])
+                        if not exists or status(self.store, db)['paused']:
+                            continue  # Forgotten/paused while preparing dispatch.
+                        scheduling_error = 'schedule:' + type(exc).__name__
+                        self.dispatcher.outbox.publish(
+                            f"定时计划 {occurrence['schedule_id']} 暂未启动。请检查朋友状态和工作目录；该期仍保留待执行。",
+                            event_key='schedule-error:' + occurrence['id'], topic='schedule.blocked',
+                            context=occurrence['context'])
             self.dispatcher.outbox.collect_tasks()
             try:
                 self.dispatcher.tick()

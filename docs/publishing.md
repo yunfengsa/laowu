@@ -6,11 +6,12 @@
 | --- | --- |
 | `laowu/`、`scripts/`、`tests/`、`pyproject.toml` | 源码及合成测试；包括文本 SQL fixture |
 | `AGENTS.md`、`friends/`、`.agents/skills/`、公开使用文档 | 稳定规则；更改时避免混入个人经历和本机运行记录 |
+| `config/friend-policy.example.json` | 总开关及各模板 enabled 全 false 的公开示例，不含来源或私有数据 |
 | `config/features.example.json` | 五项全 false 的安全示例；需要时复制为本机覆盖文件 |
 | `config/runtime-policy.json`、`config/slack-manifest.json` | 默认数值与 OAuth scope 模板，不含身份或凭据 |
-| `.codex/`、`config/features.json` | 忽略并保留本地；setup 按当前路径生成 Codex 配置，缺少 features 覆盖时默认关闭 |
+| `.codex/`、`config/features.json`、`config/friend-policy.json` | 忽略并保留本地；setup 按当前路径生成 Codex 配置，缺少 features 覆盖时默认关闭 |
 | `.laowu/`、凭据目录、`.env`、数据库及 WAL/SHM、日志、备份、密钥、缓存 | 私有或生成内容，不提交；Git ignore 不删除文件，也不改变数据备份规则 |
-| 本机验收与实施草稿 | 忽略 `docs/acceptance.md`、`docs/*-acceptance.md`、`docs/client-error-investigation.md`、`docs/*-manifest.json`、`docs/phase1-second-review.md`、`docs/*.patch`、`docs/phase1-skills/`；原文件保留本地 |
+| 本机验收、任务产物与实施草稿 | 忽略 `artifacts/`、`.review-task_*/`、`docs/acceptance.md`、`docs/*-acceptance.md`、`docs/client-error-investigation.md`、`docs/*-manifest.json`、`docs/phase1-second-review.md`、`docs/*.patch`、`docs/phase1-skills/`；原文件保留本地 |
 
 `.env.example`、`.env.*.example`、`credentials.example.json` 和 `secrets.example.json` 可以使用占位符，文件名例外不意味着内容可信。私有目录中的 example 仍不发布。测试的虚构凭据不是可用密钥；不按 token 等普通变量名判断泄露，也不因为文件位于 tests 就放行真实密钥。公开报告只记录方法与合成案例，不复制实际聊天、内部任务/运行/会话标识或主机状态。
 

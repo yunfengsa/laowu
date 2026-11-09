@@ -7,15 +7,15 @@ description: 老五安排与管理专业朋友完成编码、深入谈心或调�
 
 仅供老五主会话使用。朋友工作会话不得继续委派。
 
-1. 调用 `friend_list` 选择适合职责的朋友。默认编码用 `engineer`、深入谈心用 `confidant`、证据调查用 `researcher`。需要多种能力时拆成清楚的任务并整合结果，不让用户承担内部调度。
-2. 用 `friend_ensure(spec)` 核对或建立朋友配置，确认角色、技能、MCP 和工具的实际预检结果。已有朋友缺能力时做针对性更新；新职责确实无法覆盖时创建稳定 ID、清晰人格和最小能力集合的新朋友。未通过验证的版本不可冒充可用，运行中的任务保留原配置版本。
+1. 调用 `friend_list(include_templates=true)`，先全局复用适合职责且启用的朋友；可查询停用项，必要时先 `friend_get`。默认编码用 `engineer`、深入谈心用 `confidant`、证据调查用 `researcher`。需要多种能力时拆成清楚的任务并整合结果，不让用户承担内部调度。
+2. 现有职责确实不合适时，在本机批准模板内自主 `friend_create(template_id,name,description,instructions,idempotency_key,...)`，无需逐次确认或 root；ID 由服务端生成，永久保存且跨频道及本地复用。同一创建重试沿用幂等键。只保存通用职责，不自动复制当前任务、聊天或记忆正文。配置注册不等于真实任务已完成，继续下一步委派并审阅。主会话可先 `friend_get`，再以 `expected_version` 调用 `friend_update` 或 `friend_set_active`；冲突先重读。模板及创建时上限不可变，不增添外部 MCP、不安装技能、不提权；内置及所有文件维护角色受保护。更新只影响后续运行，停用阻止新派发和 resume，不取消活跃 run，无物理删除。
 3. 调用 `task_start(friend_id, request, workspace, idempotency_key)`。请求包括目的、允许的修改范围、验收要求和必要背景；工作目录必须真实且符合任务。幂等键代表一次逻辑任务，重试沿用它；有意创建新任务才换键。对私密话题只传给有权限的朋友，不能为“多想一想”复制整段聊天给工程师。
 4. 使用 `task_status` 或 `task_wait(task_id, timeout<=30)` 查询。读取检查点，按真实进展与用户交流；状态没变不反复播报。运行器最多同时运行两位朋友，同一工作目录的写入任务串行，不另开 CLI 绕过限制。
    用户要求后台继续、完成后通知时，按 `laowu-background` 技能使用 `task_start(background=true)`；此类任务由独立后台服务持有。只向用户确认已安排，完成结果经原会话主动交接。普通同步任务仍在本轮等待并审阅。
-5. 需要中断时 `task_cancel`。恢复前核实任务状态、已有产物和外部操作结果；仍有效且已授权的中断、受阻或失败任务用 `task_resume(task_id)` 恢复，已取消任务只在用户重新要求时恢复。`bootstrap` 只恢复状态，不能当作自动重跑请求。任务受阻或失败先明确原因，解决阻塞、修复能力或请求内容后再安排；登录失效或缺少必要权限时不伪装成功。
+5. 需要中断时 `task_cancel`。恢复前核实任务状态、已有产物和外部操作结果；仍有效且已授权的中断、受阻或失败任务用 `task_resume(task_id)` 恢复，已取消任务只在用户重新要求时恢复。`bootstrap` 只恢复状态，不能当作自动重跑请求。任务受阻或失败先明确原因，解决阻塞、修复能力或请求内容后再安排；登录失效或缺少必要权限时不伪装成功。网络、额度、权限、依赖故障须处理原因，不能用反复创建朋友来解决。
 6. 朋友最终交接必须是无 Markdown 围栏的 JSON 对象：`result` 为字符串，`artifacts`、`validation`、`unfinished` 为字符串数组，`memory_candidates` 为对象数组。`unfinished` 非空表示任务受阻（`blocked`），不能向用户宣称完成。审阅是否真正满足用户意图；把候选记忆按记忆技能确认并保存，再由老五自然地给用户完整回应。
 
-调用 `friend_ensure(spec)` 时，配置使用 `id`、`name`、`description`、`instructions`（完整角色指令）、`skills`（技能名数组）、`mcp_servers`、`can_write`、`tools`、`active`；按工具实际 schema 补齐参数。持久化后的 `friend.json` 使用 `instructions_file` 指向同目录 `AGENTS.md`，不要把文件路径误当成 API 的角色正文。技能引用本项目已有技能目录；工具用 `read/write/shell/search/web/memory/checkpoint` 的语义能力，由客户端适配器验证映射，不直接照搬宿主全部工具。继承模型，不自行指定模型或增加模型服务。
+`friend_ensure(spec)` 仅用于本地维护文件角色，Slack 禁用，不能覆盖动态 ID 或 laowu 保留身份；日常管理使用上述受控 API。`friend_list` 默认保留列表返回格式，`include_templates=true` 返回 friends、enabled、templates；`friend_get` 提供完整定义和可调范围。批准模板和所需技能须由本机维护提前准备，总开关关闭只禁止新变更，既有角色仍可查询执行。实际任务继续受频道授权、restrict_friend 和工程文件隔离探针约束，MCP scope 不代表完整文件隔离。继承模型，不自行指定模型或增加模型服务。
 
 内部朋友不是用户需操作的产品界面；无需常态播报名字。用户问起过程时如实说明。CLI 原生工具日志可能显示这些工作，不承诺隐藏。
 

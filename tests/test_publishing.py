@@ -14,7 +14,7 @@ class PublishingTests(unittest.TestCase):
     def test_ignore_policy_keeps_source_examples_and_sql_but_excludes_local_files(self):
         private = [
             '.laowu/state.sqlite3', 'nested/.laowu/queue.json', '.codex/config.toml',
-            '.codex/hooks.json', 'config/features.json', 'nested/credentials/tokens.json',
+            '.codex/hooks.json', 'config/features.json', 'config/friend-policy.json', 'nested/credentials/tokens.json',
             'nested/.env', 'nested/.env.production', 'nested/.aws/credentials',
             'nested/secrets.json', 'nested/slack-credentials.json', 'nested/id_ed25519',
             '.git-credentials', 'nested/.git-credentials', '.config/git/credentials',
@@ -30,7 +30,7 @@ class PublishingTests(unittest.TestCase):
         public = [
             'README.md', 'AGENTS.md', 'laowu/store.py', 'scripts/laowu.py',
             '.agents/skills/engineering/SKILL.md', 'friends/engineer/friend.json',
-            'tests/fixtures/phase1_schema2.sql', 'config/features.example.json',
+            'tests/fixtures/phase1_schema2.sql', 'config/features.example.json', 'config/friend-policy.example.json',
             'config/runtime-policy.json', 'config/slack-manifest.json',
             'nested/.env.example', 'nested/.env.production.example',
             'nested/credentials.example.json', 'nested/secrets.example.json',

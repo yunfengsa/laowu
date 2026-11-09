@@ -5,6 +5,20 @@ VERSION = 2
 
 
 SCHEMA = '''
+    CREATE TABLE IF NOT EXISTS friend_registry (
+      id TEXT PRIMARY KEY, version INTEGER NOT NULL, active INTEGER NOT NULL,
+      digest TEXT NOT NULL, spec_json TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS friend_versions (
+      friend_id TEXT NOT NULL, version INTEGER NOT NULL, spec_json TEXT NOT NULL,
+      created_at TEXT NOT NULL, PRIMARY KEY(friend_id,version));
+    CREATE TABLE IF NOT EXISTS friend_management (
+      friend_id TEXT PRIMARY KEY REFERENCES friend_registry(id),
+      kind TEXT NOT NULL CHECK(kind IN ('static','dynamic')), template_id TEXT,
+      ceiling_json TEXT NOT NULL DEFAULT '{}', personal INTEGER NOT NULL DEFAULT 0,
+      needs_definition INTEGER NOT NULL DEFAULT 0, origin_json TEXT NOT NULL DEFAULT '{}');
+    CREATE TABLE IF NOT EXISTS friend_creations (
+      key_hash TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
+      friend_id TEXT NOT NULL REFERENCES friend_registry(id), revoked INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS slack_result_versions(notification_id TEXT NOT NULL, task_id TEXT NOT NULL,
       run_id TEXT, result_version TEXT NOT NULL, PRIMARY KEY(notification_id,task_id));
     CREATE TABLE IF NOT EXISTS execution_routes(task_id TEXT PRIMARY KEY, context TEXT NOT NULL, queued_at TEXT NOT NULL);
@@ -53,10 +67,10 @@ SCHEMA = '''
 
 # Schema 2 shipped with several additive layouts. The revision distinguishes
 # those layouts without making schema-1/2 snapshots incompatible.
-LAYOUT_REVISION = 1
+LAYOUT_REVISION = 2
 LAYOUT_KEY = 'phase1_layout_revision'
 REPAIR_COLUMNS = {
-    'runs': {'diagnostics': "TEXT NOT NULL DEFAULT '{}'"},
+    'runs': {'diagnostics': "TEXT NOT NULL DEFAULT '{}'", 'memory_policy_json': "TEXT NOT NULL DEFAULT '{}'"},
     'sessions': {'diagnostics': "TEXT NOT NULL DEFAULT '{}'"},
     'read_retries': {
         'owner_pid': 'INTEGER', 'owner_identity': 'TEXT',
@@ -139,6 +153,10 @@ def _repair(db, *, legacy=False):
             if table == 'execution_routes' and name == 'queued_at':
                 if db.execute("SELECT 1 FROM sqlite_master WHERE name='tasks'").fetchone():
                     db.execute('UPDATE execution_routes SET queued_at=(SELECT created_at FROM tasks WHERE id=execution_routes.task_id)')
+    # Existing file roles remain protected; only the historical confidant has
+    # personal permission. Ignore any model-authored spec metadata.
+    db.execute("""INSERT OR IGNORE INTO friend_management(friend_id,kind,personal)
+        SELECT id,'static',CASE WHEN id='confidant' THEN 1 ELSE 0 END FROM friend_registry""")
     if legacy and db.execute("SELECT 1 FROM sqlite_master WHERE name='slack_result_grants'").fetchone():
         import json
         from .acceptance import result_version
@@ -180,8 +198,9 @@ def runtime_prepare(store):
         missing=[]
         for table in ('runs','sessions'):
             columns={r[1] for r in db.execute('PRAGMA table_info('+table+')')}
-            if columns and 'diagnostics' not in columns:
-                missing.append(table)
+            for name, definition in REPAIR_COLUMNS[table].items():
+                if columns and name not in columns:
+                    missing.append((table, name, definition))
         groups_missing = (bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='runs'").fetchone())
                           and not db.execute("SELECT 1 FROM sqlite_master WHERE name='run_cleanup'").fetchone())
         if meta and not missing and not groups_missing:
@@ -190,8 +209,8 @@ def runtime_prepare(store):
             store._backup_locked(db)
         db.execute('BEGIN IMMEDIATE')
         try:
-            for table in missing:
-                db.execute('ALTER TABLE '+table+" ADD COLUMN diagnostics TEXT NOT NULL DEFAULT '{}' ")
+            for table, name, definition in missing:
+                db.execute('ALTER TABLE '+table+' ADD COLUMN '+name+' '+definition)
             if groups_missing:
                 db.execute('CREATE TABLE run_cleanup (run_id TEXT PRIMARY KEY)')
                 db.execute('INSERT INTO run_cleanup SELECT id FROM runs WHERE child_pid IS NOT NULL')

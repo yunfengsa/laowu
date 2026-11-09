@@ -191,7 +191,10 @@ class ServiceTests(unittest.TestCase):
                 clock.monotonic.side_effect = [0, 10]
                 with self.assertRaises(RuntimeError):
                     self.service.call("memory_forget", {"memory_id": fact["id"]})
-            self.assertEqual(len(self.service.store.memory_search()), 1)
+            self.assertEqual(self.service.store.memory_search(), [])
+            self.assertTrue(self.service.store._ledger()['pending'])
+            from laowu.processing import status
+            self.assertTrue(status(self.service.store)['maintenance'])
         finally:
             child.terminate()
             child.wait(timeout=5)

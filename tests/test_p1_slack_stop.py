@@ -52,6 +52,8 @@ class SlackStopTests(unittest.TestCase):
                 return self.thread_id
 
             def start_turn(self, text, ident, extra_context=''):
+                with self.turn_admission():
+                    pass
                 self.input_id = ident
                 row = test.gateway._input(ident)
                 if not test.stop_during_receipt:

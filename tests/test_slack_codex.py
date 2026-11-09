@@ -1,5 +1,6 @@
 """Bidirectional protocol checks without a provider/model call."""
 import json
+import contextlib
 import os
 import queue
 import tempfile
@@ -102,6 +103,30 @@ class SlackCodexTests(unittest.TestCase):
                                     executable="/fake/codex", inventory=lambda: {"unexpected", "laowu"}, **kwargs)
         self.addCleanup(session.close)
         return session
+
+    def test_turn_admission_precedes_transport_and_releases_before_response_wait(self):
+        session = self.create()
+        session.start()
+        sent = []
+        @contextlib.contextmanager
+        def admission():
+            yield
+            # Response is produced only when the guard has exited. Holding the
+            # lock during request.wait would time out instead of returning.
+            self.process.stdout.emit({'id': sent[0]['id'], 'result': {'turn': {'id': 'admitted'}}})
+        session.turn_admission = admission
+        self.process.handle = lambda message: sent.append(message)
+        self.assertEqual(session.start_turn('synthetic', 'guarded'), 'admitted')
+        self.assertEqual(len(sent), 1)
+        @contextlib.contextmanager
+        def blocked():
+            from laowu.processing import ProcessingPaused
+            raise ProcessingPaused('forget_pending')
+            yield
+        session.turn_admission = blocked
+        with self.assertRaisesRegex(RuntimeError, 'forget_pending'):
+            session.start_event({'id': 'blocked-event'})
+        self.assertEqual(len(sent), 1)
 
     def test_start_isolated_persistent_with_complete_identity_and_filtered_environment(self):
         session = self.create()

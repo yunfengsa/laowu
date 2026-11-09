@@ -212,6 +212,8 @@ def _role(friend: dict, workspace: Path) -> str:
 def prepare_worker(root: Path, friend: dict, client: str, run_id: str, prompt: str,
                    workspace: Path, worker_token: str = "", *, access_context=None) -> WorkerLaunch:
     """Create a private run profile and return an argv/stdin launch specification."""
+    if friend.get('id') == 'laowu':
+        raise AdapterError('invalid_profile', 'laowu 不能作为 worker 身份')
     if client not in CLIENTS:
         raise AdapterError("unsupported_client", "不支持该客户端")
     if access_context:

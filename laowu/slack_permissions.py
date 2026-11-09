@@ -63,6 +63,9 @@ def profile_overrides(root, workspace, can_write):
     if not isinstance(can_write, bool):
         raise ValueError("can_write 必须为布尔值")
     root, workspace, home, raw_codex, codex_home, protected = _paths(root, workspace)
+    policy_directory = root / "config"
+    if can_write and workspace.is_relative_to(policy_directory):
+        raise PermissionError("Slack 工程目录不能位于本项目策略目录内")
     filesystem = {":root": "deny", ":minimal": "read"}
     # An overridden CODEX_HOME can differ from the actual installed executable.
     # Keep only the installation packages readable under either standard home.
@@ -70,6 +73,10 @@ def profile_overrides(root, workspace, can_write):
         filesystem[str(path)] = "read"
     filesystem[str(root)] = "read"
     filesystem[str(workspace)] = "write" if can_write else "read"
+    # Protect the containing directory as well as its files: a writable parent
+    # must not allow policy replacement, unlink, or directory rename/recreation.
+    # This applies only to this project's config, not another workspace's config.
+    filesystem[str(policy_directory)] = "read"
     credential_homes = {raw_codex, codex_home, home / ".codex", (home / ".codex").resolve()}
     for path in protected:
         if path in credential_homes:

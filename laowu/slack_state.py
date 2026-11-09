@@ -303,6 +303,8 @@ class SlackState:
 
     def recover(self):
         with self.store.transaction() as db:
+            from .slack_files import recover_sends
+            recover_sends(db)
             db.execute("UPDATE slack_bindings SET revoked=1")
             db.execute("UPDATE slack_approvals SET status='expired' WHERE status='pending'")
             db.execute("UPDATE slack_inbox SET status='uncertain',error='restart_needs_reconciliation' WHERE status IN ('running','processing')")
@@ -311,10 +313,15 @@ class SlackState:
             db.execute("INSERT OR REPLACE INTO read_sources SELECT 'output',id,'uncertain' FROM slack_outbox WHERE status='uncertain'")
 
     def status(self):
+        from .processing import status as processing_status
         config = self.config()
         with self.store.connect() as db:
             counts = {row[0]: row[1] for row in db.execute('SELECT status,count(*) FROM slack_inbox GROUP BY status')}
             sends = {row[0]: row[1] for row in db.execute('SELECT status,count(*) FROM slack_outbox GROUP BY status')}
+            file_sends = {}
+            for row in db.execute("SELECT value FROM slack_meta WHERE key LIKE 'file-send:%'"):
+                status = json.loads(row[0]).get('status', 'unknown')
+                file_sends[status] = file_sends.get(status, 0) + 1
             runtime = db.execute("SELECT value FROM slack_meta WHERE key='runtime'").fetchone()
             errors = [dict(r) for r in db.execute('SELECT id,channel_id,status,error,updated_at FROM slack_inbox WHERE error IS NOT NULL ORDER BY updated_at DESC LIMIT 10')]
         runtime = json.loads(runtime[0]) if runtime else {'status': 'stopped'}
@@ -324,7 +331,15 @@ class SlackState:
             if not runtime['running'] and runtime.get('status') == 'connected':
                 runtime['status'] = 'stale_or_stopped'
         return {'configured': bool(config.get('team_id') and config.get('owner_user_id')),
+                'processing': {**processing_status(self.store), 'enabled': bool(config.get('enabled'))},
                 'config': config, 'channels': self.channels(), 'inbox': counts, 'outbox': sends,
+                'file_sends': file_sends,
+                'file_capabilities': {'read': 'UTF-8 text <=1MiB; PDF/DOCX/XLSX and images <=20MiB; decoded image output <=4MiB',
+                                      'send': 'generated text <=8KiB; registered task artifacts <=20MiB',
+                                      'required_scopes': ['files:read', 'files:write'],
+                                      'effective_token_scopes': 'not_checked',
+                                      'binary_parsing': 'PDF text layer <=200 pages; DOCX body; XLSX cells/formulas without evaluation; no OCR or legacy DOC/XLS; requires .[slack] parsers',
+                                      'parser_limits': '15s wall/8s CPU/768MiB memory; 40MP image; ZIP 1024 entries/16MiB member/64MiB total/200 ratio; 4MiB extracted text; XLSX 100 sheets/10000 rows/256 columns/100000 cells'},
                 'recent_errors': errors,
                 'runtime': runtime,
                 'live_slack_test': 'not_performed_by_status', 'live_model_test': 'not_performed_by_status'}

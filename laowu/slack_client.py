@@ -47,6 +47,8 @@ class SlackAPI:
                 # SDK sync transport turns GET/params into POST/form. Passing
                 # json instead bypasses its query/form and boolean encoding.
                 response = client.api_call(method, http_verb='GET', params=params)
+            elif method == 'files.getUploadURLExternal':
+                response = client.api_call(method, http_verb='POST', params=params)
             elif method == 'auth.test':
                 response = client.api_call(method, params=params)
             else:
@@ -54,7 +56,7 @@ class SlackAPI:
             data = dict(response.data if hasattr(response, 'data') else response)
             if not data.get('ok', False):
                 code = data.get('error', 'api_rejected')
-                raise SlackAPIError(code, uncertain=method.startswith('chat.') and code in
+                raise SlackAPIError(code, uncertain=method.startswith(('chat.', 'files.')) and code in
                                     ('internal_error', 'fatal_error', 'request_timeout', 'service_unavailable'))
             return data
         except SlackAPIError:
@@ -76,7 +78,7 @@ class SlackAPI:
                     raise SlackAPIError('ratelimited', retry_after=retry) from None
                 if data.get('error') or status >= 500:
                     code = data.get('error') or ('http_' + str(status) if status >= 500 else 'api_rejected')
-                    uncertain = method.startswith('chat.') and (status >= 500 or code in
+                    uncertain = method.startswith(('chat.', 'files.')) and (status >= 500 or code in
                                 ('internal_error', 'fatal_error', 'request_timeout', 'service_unavailable'))
                     raise SlackAPIError(code, uncertain=uncertain) from None
             from urllib.error import URLError
@@ -98,7 +100,7 @@ class SlackAPI:
         from urllib.parse import urlencode
         from urllib.request import Request, build_opener, HTTPRedirectHandler, HTTPSHandler, ProxyHandler
         from .retries import remaining
-        if method not in _CONVERSATION_READS | {'auth.test', 'conversations.list'}:
+        if method not in _CONVERSATION_READS | {'auth.test', 'conversations.list', 'files.info'}:
             raise PermissionError('Slack 上下文只允许固定只读 API')
 
         class NoRedirect(HTTPRedirectHandler):
@@ -150,6 +152,74 @@ class SlackAPI:
             raise SlackAPIError('network_error') from None
         except (ValueError, UnicodeError):
             raise SlackAPIError('invalid_response') from None
+
+    def _file_http(self, url, *, data=None, limit):
+        """Exact Slack HTTPS origin, no redirects, proxies or URL credentials.
+
+        Download URLs come only from files.info. Upload URLs come only from
+        getUploadURLExternal; the signed upload receives NO bearer token.
+        """
+        from urllib.parse import urlsplit
+        from urllib.request import Request, build_opener, HTTPRedirectHandler, HTTPSHandler, ProxyHandler
+        from urllib.error import HTTPError, URLError
+        from .retries import remaining
+        from .slack_files import MAX_FILE
+        upload = data is not None
+        try:
+            parsed = urlsplit(url) if isinstance(url, str) else None
+            if (not parsed or len(url) > 4096 or parsed.scheme != 'https' or parsed.netloc != 'files.slack.com'
+                    or parsed.username or parsed.password or parsed.fragment
+                    or any(ord(c) < 33 for c in url) or '\\' in url
+                    or (upload and not parsed.path.startswith('/upload/'))
+                    or (not upload and not parsed.path.startswith('/files-pri/'))):
+                raise ValueError()
+        except ValueError:
+            raise SlackAPIError('file_url_denied') from None
+        if not 0 < limit <= MAX_FILE or (upload and len(data) > MAX_FILE):
+            raise SlackAPIError('file_too_large')
+
+        class NoRedirect(HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+
+        headers = {'Content-Type': 'application/octet-stream'} if upload else {
+            'Authorization': 'Bearer ' + self.client.token, 'Accept-Encoding': 'identity'}
+        request = Request(url, data=data, headers=headers, method='POST' if upload else 'GET')
+        opener = build_opener(NoRedirect(), HTTPSHandler(context=getattr(self.client, 'ssl', None)), ProxyHandler({}))
+        try:
+            with opener.open(request, timeout=remaining(10)) as response:
+                if response.status != 200 or response.headers.get('Content-Encoding', 'identity') != 'identity':
+                    raise SlackAPIError('file_http_response', uncertain=upload)
+                length = response.headers.get('Content-Length')
+                if length is not None and (not length.isdigit() or int(length) > limit):
+                    raise SlackAPIError('file_too_large', uncertain=upload)
+                chunks, size = [], 0
+                while True:
+                    remaining(10)
+                    # read1 performs at most one underlying read, so a slow
+                    # body cannot postpone the total deadline until a full
+                    # 64KiB read has accumulated.
+                    chunk = response.read1(min(64 * 1024, limit + 1 - size))
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > limit:
+                        raise SlackAPIError('file_too_large', uncertain=upload)
+                    chunks.append(chunk)
+                remaining(1)
+                return b''.join(chunks)
+        except HTTPError as exc:
+            code = exc.code
+            exc.close()
+            raise SlackAPIError('file_http_' + str(code), uncertain=upload and code >= 500) from None
+        except (URLError, OSError, TimeoutError):
+            raise SlackAPIError('file_network_error', uncertain=upload) from None
+
+    def download_file(self, url, *, limit):
+        return self._file_http(url, limit=limit)
+
+    def upload_file(self, url, data):
+        self._file_http(url, data=data, limit=4096)
 
     def members(self, channel):
         members, cursor = set(), None

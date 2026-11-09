@@ -179,8 +179,8 @@ class BackgroundTests(unittest.TestCase):
         self.assertEqual(book.list(), [])
         self.assertEqual(self.box.list()[0]['message'], '')
         self.assertEqual(self.box.list()[0]['status'], 'cancelled')
-        with self.store.connect() as db:
-            self.assertEqual(db.execute("SELECT value FROM background_meta WHERE key='paused'").fetchone()[0], '1')
+        from laowu.processing import status
+        self.assertFalse(status(self.store)['paused'])
 
     def test_restore_clears_presence_pauses_background_remaps_workspace(self):
         Registry(self.store).ensure({'id': 'engineer', 'name': '测试', 'description': '测试',
@@ -225,7 +225,7 @@ class BackgroundTests(unittest.TestCase):
             finally:
                 worker.close()
 
-    def test_paused_background_rejects_stale_submission_after_forget(self):
+    def test_context_epoch_rejects_stale_submission_after_forget(self):
         with patch.object(Manager, '_schedule', return_value=None):
             owner = Manager(self.store)
             try:
@@ -233,7 +233,7 @@ class BackgroundTests(unittest.TestCase):
                                             'instructions': '测试', 'skills': [], 'tools': ['memory'], 'can_write': False})
                 fact = self.store.memory_upsert('需要遗忘的内容')
                 self.store.memory_forget(fact['id'])
-                with self.assertRaisesRegex(RuntimeError, '后台已暂停'):
+                with self.assertRaisesRegex(ValueError, '上下文'):
                     owner.submit('engineer', '缓存中仍有的旧任务', detached=True)
                 with self.store.connect() as db:
                     self.assertEqual(db.execute('SELECT count(*) FROM tasks').fetchone()[0], 0)

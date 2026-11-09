@@ -39,6 +39,7 @@ def initialize_runtime(store):
             session_id TEXT NOT NULL, friend_id TEXT NOT NULL, friend_version INTEGER NOT NULL,
             client TEXT NOT NULL, status TEXT NOT NULL, can_write INTEGER NOT NULL,
             workspace TEXT NOT NULL, spec_json TEXT NOT NULL, token_hash TEXT NOT NULL,
+            memory_policy_json TEXT NOT NULL DEFAULT '{}',
             supervisor_pid INTEGER, supervisor_identity TEXT, child_pid INTEGER,
             child_identity TEXT, cli_session_id TEXT, event_count INTEGER NOT NULL DEFAULT 0,
             error TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, diagnostics TEXT NOT NULL DEFAULT '{}')""")
@@ -163,9 +164,13 @@ def task_record(store, task_id):
 
 def worker_access(store, run_id: str, token: str) -> dict:
     with store.connect() as db:
+        from .processing import require
+        require(store, db, background=False)
         row = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     if not row or not secrets.compare_digest(row["token_hash"], hashlib.sha256(token.encode()).hexdigest()):
         raise ValueError("无效的朋友运行凭证")
+    if row['friend_id'] == 'laowu':
+        raise PermissionError('laowu 不能作为 worker 身份')
     if row["status"] not in {"starting", "running"}:
         raise ValueError("朋友运行已结束")
     from .access import task_access
@@ -231,6 +236,8 @@ class Manager:
         self._children = {}
         self._lock = threading.RLock()
         with store.transaction() as db:
+            from .processing import epoch
+            self.context_epoch = epoch(db)
             db.execute("""INSERT INTO sessions
                 (id,client,host_session_id,owner_pid,owner_identity,status,opened_at,updated_at)
                 VALUES (?,?,?,?,?,'active',?,?)""",
@@ -244,6 +251,10 @@ class Manager:
                 db.execute("UPDATE sessions SET host_session_id=?,updated_at=? WHERE id=?", (host_session_id, now(), self.id))
 
     def _require_active(self, db):
+        from .processing import epoch, require
+        require(self.store, db, background=self.background)
+        if not self.background and self.context_epoch != epoch(db):
+            raise ValueError('遗忘或恢复已切换上下文，请先 bootstrap 恢复任务管理器')
         session = db.execute('SELECT status FROM sessions WHERE id=?', (self.id,)).fetchone()
         if self.closed.is_set() or not session or session['status'] != 'active':
             raise ValueError('会话已经关闭，请先 bootstrap 恢复任务管理器')
@@ -286,6 +297,10 @@ class Manager:
         digest = hashlib.sha256(json_text([friend_id, request, workspace]).encode()).hexdigest()
         with self.store.transaction() as db:
             self._require_active(db)
+            friend = self.registry.get(friend_id, db=db)
+            if access_context:
+                from .access import restrict_friend
+                restrict_friend(friend, access_context, root=self.root, workspace=workspace)
             if occurrence_id:
                 from .access import schedule_access
                 if not db.execute('SELECT 1 FROM schedule_occurrences WHERE id=?', (occurrence_id,)).fetchone():
@@ -298,9 +313,8 @@ class Manager:
                 if not access_context.get('input_id'):
                     raise PermissionError('Slack 任务必须绑定输入')
             if detached:
-                paused = db.execute("SELECT value FROM background_meta WHERE key='paused'").fetchone()
-                if paused and paused[0] == '1':
-                    raise RuntimeError('后台已暂停，请先核实状态并 daemon resume')
+                from .processing import require
+                require(self.store, db)
             if idempotency_key:
                 existing = db.execute("SELECT * FROM tasks WHERE idempotency_key=?", (idempotency_key,)).fetchone()
                 if existing:
@@ -349,7 +363,9 @@ class Manager:
             if row["error"] == "forgotten_context" or not row["request"].strip():
                 raise ValueError("任务内容已被遗忘，请明确创建新任务")
             from .access import task_access
-            task_access(self.store, task_id, db=db)
+            grant = task_access(self.store, task_id, db=db)
+            from .access import restrict_friend
+            restrict_friend(self.registry.get(row['friend_id'], db=db), grant, root=self.root, workspace=row['workspace'])
             db.execute("UPDATE tasks SET session_id=?,client=?,status='queued',result=NULL,error=NULL,updated_at=? WHERE id=?",
                        (self.id, self.client, now(), task_id))
             reset(db, task_id)
@@ -360,10 +376,10 @@ class Manager:
 
     def _claim(self):
         with self.store.transaction() as db:
-            if self.background:
-                paused = db.execute("SELECT value FROM background_meta WHERE key='paused'").fetchone()
-                if paused and paused[0] == '1':
-                    return None
+            from .processing import status
+            processing = status(self.store, db)
+            if processing['maintenance'] or (self.background and processing['paused']):
+                return None
             candidates = db.execute("SELECT * FROM runs").fetchall()
             pending_cleanup = {r[0] for r in db.execute('SELECT run_id FROM run_cleanup')}
             runs = [r for r in candidates if r["status"] in {"starting", "running"}
@@ -384,7 +400,7 @@ class Manager:
                 tasks = db.execute("SELECT * FROM tasks WHERE session_id=? AND status='queued'" + exclude + " ORDER BY created_at", (self.id,)).fetchall()
             for task in tasks:
                 row = db.execute("SELECT spec_json,active FROM friend_registry WHERE id=?", (task["friend_id"],)).fetchone()
-                if not row or not row["active"]:
+                if task["friend_id"] == "laowu" or not row or not row["active"]:
                     db.execute("UPDATE tasks SET status='failed',error='friend_unavailable',updated_at=? WHERE id=?", (now(), task["id"]))
                     continue
                 friend = json.loads(row["spec_json"])
@@ -399,10 +415,11 @@ class Manager:
                     continue
                 run_id, token = new_id("run"), secrets.token_urlsafe(32)
                 db.execute("""INSERT INTO runs
-                    (id,task_id,session_id,friend_id,friend_version,client,status,can_write,workspace,spec_json,token_hash,started_at,updated_at)
-                    VALUES (?,?,?,?,?,?,'starting',?,?,?,?,?,?)""",
+                    (id,task_id,session_id,friend_id,friend_version,client,status,can_write,workspace,spec_json,token_hash,started_at,updated_at,memory_policy_json)
+                    VALUES (?,?,?,?,?,?,'starting',?,?,?,?,?,?,?)""",
                     (run_id, task["id"], self.id, task["friend_id"], friend["version"], self.client,
-                     int(friend["can_write"]), task["workspace"], json_text(friend), hashlib.sha256(token.encode()).hexdigest(), now(), now()))
+                     int(friend["can_write"]), task["workspace"], json_text(friend), hashlib.sha256(token.encode()).hexdigest(), now(), now(),
+                     json_text(self.registry.memory_policy(db, task['friend_id']))))
                 db.execute("UPDATE tasks SET status='running',session_id=?,updated_at=? WHERE id=?", (self.id, now(), task["id"]))
                 return dict(task), friend, run_id, token
         return None
@@ -416,6 +433,14 @@ class Manager:
             # Serialize launch with cancel/forget. An already-claimed item cannot
             # recreate deleted context after a concurrent forget operation.
             with self.store.transaction() as db:
+                from .processing import status
+                processing = status(self.store, db)
+                if processing['maintenance']:
+                    return
+                if self.background and processing['paused']:
+                    db.execute("UPDATE runs SET status='cancelled',error='processing_paused' WHERE id=? AND status='starting'", (run_id,))
+                    db.execute("UPDATE tasks SET status='queued' WHERE id=? AND status='running'", (task['id'],))
+                    return
                 live = db.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
                 current = db.execute("SELECT * FROM tasks WHERE id=?", (task["id"],)).fetchone()
                 if self.closed.is_set() or not live or live["status"] != "starting" or current["status"] != "running":

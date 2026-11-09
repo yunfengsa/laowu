@@ -54,6 +54,8 @@ def task_access(store, task_id, *, db=None):
 
 
 def restrict_friend(friend, context, *, root=None, workspace=None):
+    if friend.get('id') == 'laowu':
+        raise PermissionError('laowu 不能作为 worker 身份')
     if not context:
         return friend
     if friend.get('mcp_servers'):
@@ -129,6 +131,8 @@ class SlackAccess:
         if db is None:
             with self.store.connect() as conn:
                 return self.validate(conn)
+        from .processing import require
+        require(self.store, db, background=False)
         row = db.execute("SELECT * FROM slack_bindings WHERE token_hash=?", (self.token_hash,)).fetchone()
         if not row or row['revoked']:
             raise PermissionError("Slack 凭证已撤销或无效")
@@ -140,7 +144,7 @@ class SlackAccess:
         self.audience = 'personal' if channel['personal'] else 'shared'
         return channel
 
-    def scopes(self, db, actor='laowu', task_id=None):
+    def scopes(self, db, actor=None, task_id=None):
         self.validate(db)
         return allowed_scopes(db, self.conversation_id, self.audience, actor, task_id)
 
@@ -187,14 +191,35 @@ class SlackAccess:
                     reply_thread=row['reply_ts'], input_id=row['id'])
 
 
-def allowed_scopes(db, conversation_id, audience, actor='laowu', task_id=None):
+def allowed_scopes(db, conversation_id, audience, actor=None, task_id=None, *, personal=False):
     channel_access(db, conversation_id, audience)
     scopes = {'shared'}
-    if audience == 'personal' and actor in ('laowu', 'confidant'):
+    if audience == 'personal' and (actor is None or personal):
         scopes.add('personal')
     rows = db.execute("SELECT task_id FROM slack_task_grants WHERE conversation_id=? AND audience=?",
                       (conversation_id, audience))
-    scopes.update('task:' + r[0] for r in rows if actor == 'laowu' or r[0] == task_id)
+    scopes.update('task:' + r[0] for r in rows if actor is None or r[0] == task_id)
+    return scopes
+
+
+def worker_scopes(store, db, run):
+    """One authorization path for search and context continuation.
+
+    The run policy is written by the scheduler, separately from model role text.
+    Legacy runs keep only the shipped confidant's historical personal grant.
+    """
+    import json
+    actor, task = run['friend_id'], run['task_id']
+    if actor == 'laowu':
+        raise PermissionError('worker 不能使用主身份')
+    policy = json.loads(run['memory_policy_json'])
+    personal = policy.get('personal', actor == 'confidant') is True
+    scopes = {'shared', 'tasks', 'friend:' + actor, 'task:' + task}
+    if personal:
+        scopes.add('personal')
+    grant = task_access(store, task, db=db)
+    if grant:
+        scopes &= allowed_scopes(db, grant['conversation_id'], grant['audience'], actor, task, personal=personal)
     return scopes
 
 

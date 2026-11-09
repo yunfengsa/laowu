@@ -8,6 +8,16 @@ from .slack_state import SlackState, conversation_id
 
 
 def route_slack_notifications(store, native_online=()):
+    # This is local routing only. Keep its event/channel snapshots and enqueue
+    # atomic with forgetting, so a cached event cannot recreate an erased inbox.
+    from .processing import status
+    with store._lock():
+        if status(store)['paused']:
+            return 0
+        return _route_slack_notifications(store, native_online)
+
+
+def _route_slack_notifications(store, native_online):
     with store.connect() as db:
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='slack_meta'").fetchone():
             return 0

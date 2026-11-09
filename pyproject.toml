@@ -10,7 +10,11 @@ requires-python = ">=3.10"
 dependencies = ["APScheduler==3.11.3", "websockets==15.0.1"]
 
 [project.optional-dependencies]
-slack = ["slack-bolt==1.30.0", "slack-sdk==3.46.0"]
+slack = [
+    "slack-bolt==1.30.0", "slack-sdk==3.46.0",
+    "Pillow==12.3.0", "pypdf==6.21.4", "python-docx==1.2.0",
+    "openpyxl==3.1.5", "defusedxml==0.7.1",
+]
 
 [project.scripts]
 laowu = "laowu.cli:main"

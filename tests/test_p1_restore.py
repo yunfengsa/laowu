@@ -268,41 +268,52 @@ class ForgetRestoreTests(unittest.TestCase):
         a = self.store.memory_upsert("first fact")
         b = self.store.memory_upsert("second fact")
         committed, proceed = threading.Event(), threading.Event()
-        original_lock = self.store._lock
-        acquisitions = 0
+        second_started, second_done = threading.Event(), threading.Event()
+        original_clear = self.store._clear_runtime_files
         failures = []
 
-        @contextlib.contextmanager
-        def interleaved_lock(timeout=None):
-            nonlocal acquisitions
-            if threading.current_thread().name == "first-forget":
-                acquisitions += 1
-                if acquisitions == 2:
-                    committed.set()
-                    if not proceed.wait(5):
-                        raise TimeoutError("test interleave timed out")
-            with original_lock(timeout):
-                yield
+        def quiesce():
+            committed.set()
+            if not proceed.wait(5):
+                raise TimeoutError("test interleave timed out")
+
+        def clear():
+            if threading.current_thread().name == 'second-forget':
+                raise OSError('second cleanup failed')
+            original_clear()
 
         def first_forget():
             try:
-                self.store.memory_forget(a["id"])
+                self.store.memory_forget(a["id"], quiesce=quiesce)
             except BaseException as exc:
                 failures.append(exc)
 
-        with patch.object(self.store, "_lock", side_effect=interleaved_lock):
+        def second_forget():
+            second_started.set()
+            try:
+                self.store.memory_forget(b['id'])
+            except OSError:
+                second_done.set()
+            except BaseException as exc:
+                failures.append(exc)
+
+        with patch.object(self.store, '_clear_runtime_files', side_effect=clear):
             first = threading.Thread(target=first_forget, name="first-forget", daemon=True)
+            second = threading.Thread(target=second_forget, name='second-forget', daemon=True)
             first.start()
             try:
                 self.assertTrue(committed.wait(5))
                 self.work(self.store, "later_private_material")
-                with patch.object(self.store, "_clear_runtime_files", side_effect=OSError("second cleanup failed")):
-                    with self.assertRaises(OSError):
-                        self.store.memory_forget(b["id"])
+                second.start()
+                self.assertTrue(second_started.wait(5))
+                self.assertFalse(second_done.wait(.05))
             finally:
                 proceed.set()
                 first.join(5)
+                second.join(5)
         self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(second_done.is_set())
         self.assertEqual(failures, [])
         self.assertTrue(self.store._ledger()["pending"])
         restarted = Store(self.store.root)

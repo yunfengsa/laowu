@@ -48,7 +48,7 @@ def path_rule(path):
         return 'invalid-path'
     if any(part in PRIVATE_DIRS or part.endswith('.egg-info') for part in p.parts[:-1]):
         return 'private-directory'
-    if path == 'config/features.json' or path.endswith('.claude/settings.local.json'):
+    if path in {'config/features.json', 'config/friend-policy.json'} or path.endswith('.claude/settings.local.json'):
         return 'local-config'
     if p.parts[-3:] == ('.config', 'git', 'credentials'):
         return 'private-file'

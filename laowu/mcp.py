@@ -48,14 +48,16 @@ def serve(root, client="codex", worker_run=None, worker_token=None, *, slack_tok
                     "instructions": ("你是已认证的朋友工作会话，无需且不能调用主会话 bootstrap。"
                                      "只检索获授权记忆、保存本任务检查点并向老五交接；不能继续委派。"
                                      if worker_run else
-                                     "先调用 bootstrap 恢复状态；只在成功保存后声称已记住。朋友运行不拥有继续委派接口。")}
+                                     "先调用 bootstrap 恢复状态；只在成功保存后声称已记住。"
+                                     "先复用职责，不适合时按批准模板自主 friend_create，再 task_start 并审阅交接。"
+                                     "配置注册不等于任务完成；故障不通过反复创建朋友处理。朋友不能管理角色或继续委派。")}
             elif method == "ping":
                 response["result"] = {}
             elif method == "tools/list":
                 response["result"] = {"tools": [{"name": name, "description": description, "inputSchema": definition,
-                    "annotations": {"readOnlyHint": name in {"memory_search", "task_status", "task_wait", "context_read", "slack_channels", "slack_history", "slack_thread"},
+                    "annotations": {"readOnlyHint": name in {"friend_get", "memory_search", "task_status", "task_wait", "context_read", "slack_channels", "slack_history", "slack_thread", "slack_file_read", "slack_file_status"},
                                     "destructiveHint": name in {"memory_forget", "task_cancel"},
-                                    "openWorldHint": name in {"task_start", "task_resume"}}}
+                                    "openWorldHint": name in {"task_start", "task_resume", "slack_file_send"}}}
                     for name, description, definition in visible_tools(worker_run, service.access)]}
             elif method == "tools/call":
                 try:
@@ -64,7 +66,9 @@ def serve(root, client="codex", worker_run=None, worker_token=None, *, slack_tok
                     result = service.call(name, arguments)
                     from .context import Context
                     result = Context(service).present(name, arguments, result)
-                    response["result"] = {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, separators=(",", ":"))}], "isError": False}
+                    from .slack_files import TOOLS as FILE_TOOLS, file_content
+                    response["result"] = (file_content(service.store, result) if name in FILE_TOOLS else
+                        {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, separators=(",", ":"))}], "isError": False})
                 except Exception as exc:
                     safe = str(exc) if isinstance(exc, (ValueError, PermissionError, RuntimeError)) else type(exc).__name__
                     if len(safe.encode()) > 2048:

@@ -1,0 +1,48 @@
+{
+  "enabled": false,
+  "templates": {
+    "engineer": {
+      "enabled": false,
+      "skills": [
+        "engineering"
+      ],
+      "tools": [
+        "read",
+        "write",
+        "shell",
+        "search",
+        "memory",
+        "checkpoint"
+      ],
+      "can_write": true,
+      "personal": false
+    },
+    "researcher": {
+      "enabled": false,
+      "skills": [
+        "research"
+      ],
+      "tools": [
+        "read",
+        "search",
+        "web",
+        "memory",
+        "checkpoint"
+      ],
+      "can_write": false,
+      "personal": false
+    },
+    "confidant": {
+      "enabled": false,
+      "skills": [
+        "listening"
+      ],
+      "tools": [
+        "memory",
+        "checkpoint"
+      ],
+      "can_write": false,
+      "personal": true
+    }
+  }
+}

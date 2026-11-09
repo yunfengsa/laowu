@@ -122,16 +122,25 @@ class Outbox:
                 JOIN async_tasks a ON t.id=a.task_id WHERE a.notified_generation<a.generation
                 AND t.status IN ('completed','failed','blocked','cancelled')""").fetchall()
         for row in rows:
-            # Read the result when presenting, rather than duplicating sensitive task output.
-            from .acceptance import snapshot
-            with self.store.connect() as db:
-                acceptance = snapshot(db, row["id"])["state"]
-            self.publish(f"验收状态：{acceptance}。执行结束不等于验收通过。后台任务 {row['id']} 已进入 {row['status']} 状态。请读取 task_status 的结果、验证与未完成事项后告知用户。",
-                         event_key=f"task:{row['id']}:{row['generation']}", topic='task.' + row['status'],
-                         origin_thread=row['origin_thread'], context=row['context'], task_id=row['id'])
-            with self.store.transaction() as db:
-                db.execute("UPDATE async_tasks SET notified_generation=? WHERE task_id=? AND generation=?",
-                           (row['generation'], row['id'], row['generation']))
+            with self.store._lock(), contextlib.closing(self.store.connect()) as db:
+                from .processing import status
+                current = db.execute('SELECT generation,notified_generation FROM async_tasks WHERE task_id=?', (row['id'],)).fetchone()
+                if (status(self.store, db)['paused'] or not current or current['generation'] != row['generation']
+                        or current['notified_generation'] >= row['generation']):
+                    continue
+                self._collect_task(row)
+
+    def _collect_task(self, row):
+        # Read the result when presenting, rather than duplicating sensitive task output.
+        from .acceptance import snapshot
+        with self.store.connect() as db:
+            acceptance = snapshot(db, row["id"])["state"]
+        self.publish(f"验收状态：{acceptance}。执行结束不等于验收通过。后台任务 {row['id']} 已进入 {row['status']} 状态。请读取 task_status 的结果、验证与未完成事项后告知用户。",
+                     event_key=f"task:{row['id']}:{row['generation']}", topic='task.' + row['status'],
+                     origin_thread=row['origin_thread'], context=row['context'], task_id=row['id'])
+        with self.store.transaction() as db:
+            db.execute("UPDATE async_tasks SET notified_generation=? WHERE task_id=? AND generation=?",
+                       (row['generation'], row['id'], row['generation']))
 
 
 class Presence:
@@ -196,13 +205,14 @@ class Presence:
 
 
 def daemon_status(store):
+    from .processing import status
     with store.connect() as db:
+        processing = status(store, db)
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='daemon_state'").fetchone():
-            return {'running': False, 'status': 'not_installed'}
+            return {'running': False, 'status': 'not_installed', **processing}
         row = db.execute("SELECT * FROM daemon_state WHERE singleton=1").fetchone()
-        paused = db.execute("SELECT value FROM background_meta WHERE key='paused'").fetchone()
     result = dict(row) if row else {'status': 'stopped'}
-    result['paused'] = bool(paused and paused[0] == '1')
+    result.update(processing)
     result['running'] = bool(row and process_alive(row['pid'], row['identity'])
                              and row['heartbeat'] and time.time() - row['heartbeat'] < 60
                              and row['status'] == 'running')
